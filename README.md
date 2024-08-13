@@ -3,6 +3,9 @@ The figure scripts pertaining to the manuscript titled "Genomic structures and r
 <br />
 # Script Directory <br />
 
+### **All Figures** <br />
+Please download the `figures/AllFigsMaster.html` document to see the most recent run through of all figures. Associated scripts can also be found in the `figures/AllFigsMaster.Rmd` R markdown. Below are figure-specific scripts but the might be more outdated than the R markdown document. 
+
 ### **Figure 1** <br />
 | Panel           | Script                                    | 
 | :---            |    :----:                                 |  
