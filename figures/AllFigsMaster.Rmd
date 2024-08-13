@@ -1,0 +1,3780 @@
+---
+title: "Manuscript Figures"
+author: "Dr. Vanessa Porter"
+date: "2024-06-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+.libPaths("/projects/vporter_prj/R/x86_64-centos7-linux-gnu-library/4.0")
+suppressMessages(library(ggplot2))
+suppressMessages(library(cowplot))
+suppressMessages(library(cli))
+suppressMessages(library(optparse))
+suppressMessages(library(reshape2))
+suppressMessages(library(ggplot2))
+suppressMessages(library(tidyr))
+suppressMessages(library(stringr))
+suppressMessages(library(dplyr))
+suppressMessages(library(RColorBrewer))
+suppressMessages(library(ggupset))
+suppressMessages(library(viridis))
+suppressMessages(library(FSA))
+suppressMessages(library(ggpubr))
+suppressMessages(library(knitr))
+suppressMessages(library(pafr))
+suppressMessages(library(cutr))
+suppressMessages(library(valr))
+suppressMessages(library(ggsci))
+suppressMessages(library(ggrepel))
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+source("/projects/hpv_nanopore_prj/manuscript2022/rproj/functions.R")
+```
+
+## Categorizing HPV Integration Events (Figure 1)
+
+In this section of the analysis, we organize the workflow outputs to summarize the categorization of HPV integration events. These figures make up part of Figure 1 in the manuscript.
+
+#### Integration event types
+
+Here we are reading in the integration event types from the workflow output. Each integration event is categorized as one of the following based on breakpoint numbers, breakpoint positions, and read alignment patterns:
+
+1.  dup-like integration
+2.  del-like integration
+3.  multi-breakpoint integration
+4.  translocation integration
+5.  repeat integration
+6.  unmatched integration 
+
+```{r int_event_types, include = FALSE}
+# Define the directories for the first and second datasets
+dir1 <- "/projects/hpv_nanopore_prj/htmcp/call_integration/output"
+
+# List all files containing "integration_type.txt" in both directories
+all_files <- list.files(dir1, recursive = TRUE, full.names = T, pattern = "integration_type.txt")
+
+# Extract sample names from the file paths
+names <- gsub(paste0(dir1, "/|intType/|/integration_type.txt"), "", all_files)
+
+# Read data from all files and store in a list
+data_list <- lapply(all_files, read.delim, header=F)
+
+# Set names for the list elements based on sample names
+names(data_list) <- names
+
+# Combine the dataframes in the list into a single dataframe, adding an "event" column
+int <- bind_rows(data_list, .id = "event")
+
+# Extract the "event" column and separate it into "sample" and "event" columns
+int$event <- as.character(int$event)
+int <- separate(int, event, into = c("sample", "event"), sep = "/")
+colnames(int)[3] <- "type"
+```
+
+
+```{r, int_event_types2}
+dim(int)
+kable(head(int))
+```
+
+#### Integration breakpoints and events
+
+We will also read in the event summary data, which groups each integration breakpoint into an integration event.
+
+```{r int_event_sum, include=FALSE}
+## -------------------------------------------------------------------------
+## Import Integration Summary Data
+## -------------------------------------------------------------------------
+
+# load in all the events files
+ontSitesFiles <- grep("events/summary.txt", list.files(dir1, recursive = T, full.names = T), value = T)
+
+# Extract sample names from the file paths
+names2 <- gsub(paste0(dir1, "/|/events/summary.txt"), "", ontSitesFiles)
+
+# import ont sites
+sum_list <- lapply(ontSitesFiles, read.delim, header=T)
+
+# Set names for the list elements based on sample names
+names(sum_list) <- names2
+
+# Combine the dataframes in the list into a single dataframe, adding an "library" column
+sum <- bind_rows(sum_list, .id = "sample")
+```
+
+```{r}
+dim(sum)
+kable(head(sum))
+```
+
+
+#### Add the episomal samples to the event summary list
+
+Events without any integration detected do not have an integration type, so we will add these to the summary file so all samples are included.
+
+```{r episome_sum, include=FALSE}
+## -------------------------------------------------------------------------
+## Fix the integration event calls for select samples
+## -------------------------------------------------------------------------
+# add nsites
+# number of integration events
+summary1 <- sum[complete.cases(sum),] %>% 
+    group_by(sample, event) %>%
+    summarize(n = n())
+
+#find the missing events
+missing <- data.frame(event = unique(paste0(sum$sample, ":", sum$event))[!unique(paste0(sum$sample, ":", sum$event)) %in% paste0(int$sample, ":", int$event)])
+missing <- missing %>% separate(event, c("sample", "event"), sep = ":")
+missing$nsites <- summary1$n[match(paste0(missing$sample, ":", missing$event), paste0(summary1$sample, ":", summary1$event))]
+
+missing <- missing %>%
+  mutate(type = case_when(
+    is.na(nsites) ~ "no_detected_integration"))
+
+# add missing calls to df
+int <- rbind(int[,1:3], missing[,c(1,2,4)])
+int$HPV.type <- sum$HPVchr[match(int$sample, sum$sample)]
+int$type[is.na(int$type)] <- "no_detected_integration"
+
+# fix a non-repeat sample
+int$type[int$sample == "HTMCP-03-06-02267" & int$event == "event1"] <- "multi-breakpoint_integration" 
+
+int$nsites <- summary1$n[match(paste0(int$sample, ":", int$event), paste0(summary1$sample, ":", summary1$event))]
+int$nsites[is.na(int$nsites)] <- 0
+
+# add HPV type
+int$HPV.type <- sum$HPVchr[match(paste0(int$sample, ":", int$event), paste0(sum$sample, ":", sum$event))]
+
+# only integration
+intOnly <- int[!int$type %in% c("no_detected_integration"),]
+
+# add to summary 
+sum$integration_type <- int$type[match(paste0(sum$sample, sum$event), paste0(int$sample, int$event))]
+```
+
+```{r}
+kable(head(summary1))
+```
+
+
+#### Add the transcriptional status to the summary files
+
+The RNA HPV-human fusion breakpoints were detected using short-read RNA-seq. These fusions were then intersected with the ONT-called integration events to determine which event(s) had evidence of expression in a sample.
+
+```{r expressed_sum, include=FALSE}
+### -------------------------------------------------------------------------------
+### READ IN EXPRESSED HPV BREAKPOINTS FILES 
+### -------------------------------------------------------------------------------
+
+f <- grep("expressed_hpv_integration_sites.bed", list.files("/projects/hpv_nanopore_prj/htmcp/illumina_call_integration_rna/output", recursive = T, full.names = T), value = T)
+n <- gsub("/projects/hpv_nanopore_prj/|htmcp|/illumina_call_integration_rna/output/|/expressed_hpv_integration_sites.bed", "", f)
+
+list_dataframes <- list()
+for (i in 1:length(f)) {
+  # Check if the file is empty
+  if (file.info(f[i])$size > 0) {
+    df <- read.delim(f[i], header = FALSE)  # Read the file if it's not empty
+    list_dataframes[[i]] <- df
+  } else{
+    list_dataframes[[i]] <- NULL
+  }
+}
+names(list_dataframes) <- n
+
+# expressed HPV breakpoints 
+ehpv <- dplyr::bind_rows(list_dataframes, .id = "sample")
+colnames(ehpv) <- c("sample", "chr", "start", "stop", "id", "score",
+                    "strand", "nreads", "hpv.site.chr", "hpv.site.start", "hpv.site.stop", "hpv.site", "distance")
+
+# add event name to expressed breakpoints
+ehpv$event <- sum$event[match(paste0(ehpv$sample, ehpv$hpv.site), paste0(sum$sample, sum$HPV.site))]
+ehpv$integration_type <- sum$integration_type[match(paste0(ehpv$sample, ehpv$hpv.site), paste0(sum$sample, sum$HPV.site))]
+
+# sum the reads per sample
+s <- ehpv %>%
+  group_by(sample) %>%
+  summarise(sum.reads = sum(nreads),
+            max.reads = max(nreads))
+
+# determine which RNA fusion is most expressed in the sample
+ehpv$sum.reads <- s$sum.reads[match(ehpv$sample, s$sample)]
+ehpv$max.reads <- s$max.reads[match(ehpv$sample, s$sample)]
+ehpv$percent.of.reads <- ehpv$nreads / ehpv$sum.reads
+ehpv$is.max.site <- ifelse(ehpv$nreads == ehpv$max.reads, "max", "other")
+```
+
+
+```{r}
+# add the transcriptional status to the summary dataframes
+sum$is.event.transcribed <- ifelse(paste0(sum$sample, sum$event) %in% paste0(ehpv$sample, ehpv$event), "yes", "no")
+intOnly$is.event.transcribed <- ifelse(paste0(intOnly$sample, intOnly$event) %in% paste0(ehpv$sample, ehpv$event), "yes", "no")
+
+kable(head(sum))
+```
+
+
+#### Summarize samples by number of integration sites/events
+
+Here, the number of integration sites/events are summarized by sample for an easy reference
+
+```{r sumtables, include=FALSE}
+# number of integration events
+summary1 <- sum[complete.cases(sum),] %>% 
+    group_by(sample, event) %>%
+    summarize(n = n())
+
+summary <- summary1 %>% 
+  group_by(sample) %>%
+  summarize(events = n(), sites = sum(n))
+
+summary2 <- sum[complete.cases(sum),] %>% 
+  group_by(sample) %>%
+  summarize(chromosomes = paste(unique(chr), collapse = ","))
+
+summary3 <- sum[complete.cases(sum),] %>% 
+     group_by(sample, event, is.event.transcribed) %>%
+     summarize(n = n()) %>%
+     group_by(sample, is.event.transcribed) %>%
+     summarize(n = n()) %>%
+     filter(is.event.transcribed == "yes")
+
+summary4 <- sum[complete.cases(sum),] %>% 
+  group_by(sample, event, integration_type, chr) %>%
+  summarize(size = max(pos) - min(pos))
+
+summary$transcribed.events <- summary3$n[match(summary$sample, summary3$sample)]
+summary$transcribed.events[is.na(summary$transcribed.events)] <- 0
+summary$HPV.type <- sum$HPVchr[match(summary$sample, sum$sample)]
+summary$chromosomes <- summary2$chromosomes[match(summary$sample, summary2$sample)]
+
+# samples with no integration 
+noint <- sum$sample[sum$integration_type == "no_detected_integration"]
+summary <- rbind(summary, data.frame(sample = noint, events = rep(0, length(noint)), sites = rep(0, length(noint)), transcribed.events = rep(0, length(noint)),
+                                     HPV.type = rep(NA, length(noint)), chromosomes = rep(NA, length(noint))))
+```
+
+```{r}
+kable(head(summary))
+```
+
+#### Simplify the data for figures
+
+Figures describing the integration events are created using simplified versions of these tables. First, to describe the integration types by HPV type, we will make a simplified HPV type. Events will either be categorized as HPV16, HPV18, HPV45, or other HPV type.
+
+```{r hpvtypes, include=FALSE}
+## -------------------------------------------------------------------------
+## Figures - Fig 1ef
+## -------------------------------------------------------------------------
+
+# simplify the HPV type
+intOnly$HPV.type.simp <- ifelse(!intOnly$HPV.type %in% c("HPV16", "HPV45", "HPV18"), "Other_HPV", intOnly$HPV.type)
+intOnly <- intOnly %>%
+  mutate(HPV.clade = case_when(
+    HPV.type %in% c("HPV16", "HPV52", "HPV31", "HPV33", "HPV35", "HPV53", "HPV58")  ~ "A9",
+    HPV.type %in% c("HPV18", "HPV45", "HPV59", "HPV68")  ~ "A7",
+    HPV.type %in% c("HPV82", "HPV51", "HPV26", "HPV30", "HPV69", "HPV73", "HPV29")  ~ "Other"))
+
+## bubble plot summary
+ntypes <- intOnly %>%
+  group_by(HPV.type.simp, type) %>%
+  summarise(n = n())
+nHPV <- intOnly %>%
+  group_by(HPV.type.simp) %>%
+  summarise(n = n())
+nAll <- intOnly %>%
+  group_by(type) %>%
+  summarise(n = n())
+nAll2 <- intOnly %>%
+  group_by(type, is.event.transcribed) %>%
+  summarise(n = n())
+
+# add the information to the dataframe
+ntypes$nHPV <- nHPV$n[match(ntypes$HPV.type.simp, nHPV$HPV.type.simp)]
+ntypes$percent <- ntypes$n / ntypes$nHPV
+
+# simplify the name of the integration type
+nAll2$type <- gsub("_integration|_integrated", "", nAll2$type)
+nAll$type <- gsub("_integration|_integrated", "", nAll$type)
+ntypes$type <- gsub("_integration|_integrated", "", ntypes$type)
+
+# factor the types for order
+ntypes$type <- factor(ntypes$type, levels = rev(c("translocation", "dup-like", "del-like",
+                                              "multi-breakpoint", "repeat", "unmatched")))
+
+```
+
+#### Create a figure for the integration event types from various HPV types
+
+This figure depicts what proportion of events from each HPV type belong to each integration event category.
+
+```{r bubbleplot, echo=TRUE}
+p <- ggplot(ntypes, aes(x = HPV.type.simp, y = type, size = percent)) +
+  geom_point(colour="black",pch=21, fill = "grey") + 
+  theme_minimal() +
+  scale_size(range = c(2,15)) +
+  labs(x = NULL, y = NULL) +
+  theme(axis.text = element_text(size = 12, face = "bold", colour = "black"))
+ggsave(filename = "figure1/intType_HPVs.pdf", plot = p, height = 5, width = 8, units = "in")
+p
+```
+
+#### Create a figure for the number of integration types
+
+This figure depicts the number of each integration event type found across the cohort, and what proportion of the events are expressed (yes = transcribed, no = not transcribed).
+
+```{r barplot, echo=TRUE}
+## Integration types bar plot
+nAll <- nAll %>% arrange(desc(n))
+nAll2$type <- factor(nAll2$type, levels = nAll$type)
+
+p1 <- ggplot(nAll2, aes(x = type, y = n, fill = is.event.transcribed)) +
+  geom_bar(stat = "identity", colour = "black") + 
+  theme_minimal() +
+  labs(y = "# of events", x = NULL, fill = NULL) +
+  scale_fill_manual(values = c("#8d99ae", "#fb8500"))+
+  theme(axis.text.y = element_text(colour = "black", size = 13),
+        axis.text.x = element_text(colour = "black", size = 13, angle = 45, hjust = 1, vjust = 1),
+        axis.title = element_text(colour = "black", size = 14, face = "bold"),
+        legend.text = element_text(size = 12, colour = "black"),
+        panel.grid.minor = element_blank(), 
+        panel.grid.major.x = element_blank(), 
+        axis.ticks.y = element_line(),
+        axis.line = element_line())
+ggsave(filename = "figure1/intType_num.pdf", plot = p1, height = 3, width = 6, units = "in")
+p1
+```
+
+#### Test if dup-like events are transcribed more than other events
+
+It appears a higher proportion of dup-like events are transcribed than other types. We will use a Fisher's Exact test to see if that is significant.
+
+```{r pval1, echo=TRUE}
+# Fisher's exact test
+fisher.test(matrix(c(nAll2$n[nAll2$type == "dup-like" & nAll2$is.event.transcribed == "yes"],
+                     nAll2$n[nAll2$type == "dup-like" & nAll2$is.event.transcribed == "no"],
+                     sum(nAll2$n[nAll2$type != "dup-like" & nAll2$is.event.transcribed == "yes"]),
+                     sum(nAll2$n[nAll2$type != "dup-like" & nAll2$is.event.transcribed == "no"])), 
+                   byrow = T, nrow = 2))
+
+# percent of  events that are transcribed
+nAll2$n[nAll2$type == "dup-like" & nAll2$is.event.transcribed == "yes"] / sum(nAll2$n[nAll2$type == "dup-like"])
+nAll2$n[nAll2$type == "del-like" & nAll2$is.event.transcribed == "yes"] / sum(nAll2$n[nAll2$type == "del-like"])
+nAll2$n[nAll2$type == "multi-breakpoint" & nAll2$is.event.transcribed == "yes"] / sum(nAll2$n[nAll2$type == "multi-breakpoint"])    
+nAll2$n[nAll2$type == "translocation" & nAll2$is.event.transcribed == "yes"] / sum(nAll2$n[nAll2$type == "translocation"])
+nAll2$n[nAll2$type == "unmatched" & nAll2$is.event.transcribed == "yes"] / sum(nAll2$n[nAll2$type == "unmatched"])
+nAll2$n[nAll2$type == "repeat" & nAll2$is.event.transcribed == "yes"] / sum(nAll2$n[nAll2$type == "repeat"])
+sum(nAll2$n[nAll2$is.event.transcribed == "yes"])
+sum(nAll2$n[nAll2$is.event.transcribed == "no"])
+```
+
+#### Upset plot across the number of integration event types
+
+This plot depicts the overlap of different integration event types co-occurring in a sample using an upset plot.
+
+```{r upsetplot, echo=TRUE}
+## UPSET PLOT DIFF TYPES
+p2 <- intOnly %>%
+  distinct(sample, type) %>%
+  group_by(sample) %>%
+  summarise(list = list(type)) %>%
+  ggplot(aes(x=list)) +
+  geom_bar() +
+  scale_x_upset() +
+  theme_minimal() +
+  theme(axis.text.y = element_text(colour = "black", size = 13),
+        axis.title = element_blank(),
+        legend.text = element_text(size = 12, colour = "black"),
+        panel.grid.minor = element_blank(), 
+        panel.grid.major.x = element_blank(), 
+        axis.ticks.y = element_line(),
+        axis.line = element_line(),
+        plot.margin = margin(1,1,1.5,6, "cm"))
+ggsave(filename = "figure1/intType_upset.pdf", plot = p2, height = 4, width = 6, units = "in")
+p2
+```
+
+#### Statistical information about the samples and events
+
+Here we list various statistical numbers for the manuscript to describe HPV integration in this cohort.
+
+```{r}
+## -------------------------------------------------------------------------
+## Stats - Fig 1ef
+## -------------------------------------------------------------------------
+
+length(unique(int$sample)) # number of samples
+length(unique(int$sample[int$type != "no_detected_integration"])) # number of integrated samples
+nevents <- length(int$sample[int$type != "no_detected_integration"])
+nevents # number of events
+nsites <- nrow(sum[sum$integration_type != "no_detected_integration",])
+nsites # number of sites
+sum(int$type == "multi-breakpoint_integration")/nevents # percent of multi-breakpoint events
+sum(int$type == "multi-breakpoint_integration") # number of multi-breakpoint events
+sum(int$type == "del-like_integration") # number of del-like events
+sum(int$type == "dup-like_integration") # number of dup-like events
+sum(int$type == "translocation_integration") # number of translocation events
+sum(int$type == "repeat_integration") # number of repeat events
+sum(int$type == "unmatched_integration") # number of unmatched events
+
+summary(factor(intOnly$type[intOnly$HPV.type == "HPV16"])) # types of events by HPV type - HPV16
+summary(factor(intOnly$type[intOnly$HPV.type == "HPV18"])) # types of events by HPV type - HPV18
+summary(factor(intOnly$type[intOnly$HPV.type == "HPV45"])) # types of events by HPV type - HPV45
+```
+
+```{r savetables1, include=FALSE}
+## -------------------------------------------------------------------------
+## Source tables and supp tables
+## -------------------------------------------------------------------------
+
+# integration types
+write.table(nAll, file = "sourceTables/fig1e.txt", col.names = T, row.names = F, sep = "\t", quote = F)
+
+## integration types by HPV type
+write.table(ntypes, file = "sourceTables/fig1f.txt", col.names = T, row.names = F, sep = "\t", quote = F)
+
+# integration site locations
+write.table(sum, "tables/intSitesSummaryAll.txt", quote = F, sep = "\t", col.names = T, row.names = F)
+
+# integration event types
+write.table(intOnly, "tables/integrationTypes.txt", quote = F, sep = "\t", col.names = T, row.names = F)
+```
+
+## Meta data for sequenced samples
+
+To introduce the samples, we will tabulate and show all the metadata for the sequenced samples and also include a summary of the integration events.
+
+```{r, include=FALSE}
+htmcp <- read.delim("/projects/vporter_prj/projects/cxca_hiv_cohort/tables/Supplementary_table_1.txt", header = T)
+htmcpRan <- read.delim("/projects/hpv_nanopore_prj/htmcp/call_integration/output/ran_libraries.txt", header = F)
+
+# put all the samples together
+all <- rbind(htmcpRan)
+
+## ---------------------------------------------------------------------------
+## Combine with the meta data
+## ---------------------------------------------------------------------------
+
+# get the HTMCP only meta data
+htmcpMeta <- htmcp[htmcp$Patient %in% htmcpRan$V1,]
+
+# load in all the events files
+sumHTMCP <- sum[grep("HTMCP", sum$sample),]
+
+# get the HPV types
+sumHTMCP <- sumHTMCP[!duplicated(sumHTMCP[,c(1,4)]),c(1,4)]
+
+# binarize linear values
+htmcpMeta$Age <- ifelse(htmcpMeta$Age < 45, "Under45", 
+                   ifelse(htmcpMeta$Age >= 45 & htmcpMeta$Age <= 65, "A45to65", "Over65"))
+htmcpMeta$Max.APOBEC.score <- ifelse(htmcpMeta$Max.APOBEC.score < 0.2, "Under0.2", 
+                                ifelse(htmcpMeta$Max.APOBEC.score <= 0.4 & htmcpMeta$Max.APOBEC.score >= 0.2, "A0.2to0.4","Over0.4"))
+htmcpMeta$HRD.score <- ifelse(htmcpMeta$HRD.score < 10, "Under10", 
+                         ifelse(htmcpMeta$HRD.score <= 30 & htmcpMeta$HRD.score >= 10, "A10to30","Over30"))
+htmcpMeta$Ploidy <- ifelse(htmcpMeta$Ploidy == 1, "one", 
+                      ifelse(htmcpMeta$Ploidy == 2, "two",
+                             ifelse(htmcpMeta$Ploidy == 3, "three","four")))
+
+# fix Stage values
+htmcpMeta$Stage <- gsub(" ", "_", htmcpMeta$Stage)
+htmcpMeta$Stage <- gsub("B[1-2].*", "", htmcpMeta$Stage)
+htmcpMeta$Stage <- gsub("A[1-2].*", "", htmcpMeta$Stage)
+htmcpMeta$Stage <- gsub("B|A", "", htmcpMeta$Stage)
+htmcpMeta$Stage <- factor(htmcpMeta$Stage, levels = c("Stage_I", "Stage_II","Stage_III", "Stage_IV" ))
+
+# check if the HPV type in the meta matches the integration
+x <- htmcpMeta[order(as.character(htmcpMeta$Patient)),c(1,12)]
+rownames(x) <- 1:nrow(x)
+y <- sumHTMCP[order(as.character(sumHTMCP$library)),]
+
+all(x$HPV.type == y$HPVchr) # true
+
+# long format 
+htmcpMeta <- htmcpMeta[,c("Patient","HIV.status", "Stage", "Grade","Final.histology", 
+             "Age", "HPV.type", "HPV.clade", "Max.APOBEC.score", "HRD.score", "Ploidy")]
+anno <- melt(htmcpMeta, id = "Patient")
+colnames(anno) <- c("Patient", "row", "value")
+anno$row <- factor(anno$row, levels = c("Ploidy","HRD.score", "Max.APOBEC.score","Estimated.Tumour.purity", 
+                                        "Age", "Grade", "Stage", "Final.histology", "HIV.status", 
+                                        "num.of.sites","HPV.clade","HPV.type"))
+
+```
+
+```{r, include=FALSE}
+htmcpSum <- summary[grep("HTMCP", summary$sample),]
+
+# colour the metadata for the figure
+meta_colours <- list(values = c(Negative="black", Positive="#FACDBE", 
+                                Adenocarcinoma="#9E9AC7", Adenosquamous="#DEC9E2", Squamous="#D2E1E9", Neuroendocrine="#6DA3C2", Undifferentiated="#A9A9A9",
+                                G1="#FEE5CE", G2="#EAA973", G3="#F47A14",G4="#b35608",
+                                Stage_I="#F4D3AE", Stage_II="#FAAD6C", Stage_III="#F06A22",Stage_IV="#8C2F1C",
+                                Under45="white", A45to65="grey", Over65="black",
+                                Under10="#ECE7F2", A10to30="#A6BDDB", Over30="#2B8CBE",
+                                Under0.2="#FDE0DD", A0.2to0.4="#FA9FB5", Over0.4="#C51B8A", A7="#B55F8F", A9="#253083", Other="#A9A9A9",
+                                HPV16="#3953A4", HPV18="#9768ad", HPV45="#CC138C", HPV82="#323636", HPV33="#2ba8be", 
+                                HPV52="#0B8DCD", HPV31="#d2ecf9", HPV73="#737474", HPV68="#f3b2d4", HPV97="black", HPV58="#5f7bbd", HPV59="#ffcad4", HPV26="#6d6e71",
+                                two="#EFEDF5", three="#BCBDDC", four="#756BB1"))
+
+
+
+# make the sample order
+htmcpMeta$events <- htmcpSum$events[match(htmcpMeta$Patient, htmcpSum$sample)]
+htmcpMeta$transcribed.events <- htmcpSum$transcribed.events[match(htmcpMeta$Patient, htmcpSum$sample)]
+type <- table(factor(htmcpMeta$HPV.type))
+type <- names(type[order(type, decreasing = T)])
+htmcpMeta$HPV.type <- factor(htmcpMeta$HPV.type, levels = type)
+htmcpMeta$HPV.clade <- factor(htmcpMeta$HPV.clade, levels = c("A9", "A7", "Other"))
+order <- htmcpMeta %>%
+  arrange(factor(HPV.type, levels = c("HPV16", "HPV18", "HPV45", "HPV58","HPV59", "HPV31", "HPV82", "HPV52", "HPV68","HPV33", "HPV73","HPV26")), desc(events), desc(transcribed.events)) %>%
+  select(Patient)
+
+# factor the sample order
+anno$Patient <- factor(anno$Patient, levels = order$Patient)
+htmcpSum$sample <- factor(htmcpSum$sample, levels = order$Patient)
+
+all(levels(htmcpSum$library) == levels(anno$Patient))
+```
+
+#### Create the metadata figure
+
+```{r}
+kable(head(htmcpSum))
+
+# number of integration events
+a1 <- ggplot(htmcpSum, aes(x = sample, y = events)) +
+  geom_bar(stat = "identity", colour = "black", fill = "grey", size = 0.25) +
+  theme_minimal() +
+  labs(y = "# of events") +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.y = element_text(size = 12, colour = "black"),
+        axis.title.y = element_text(size = 14, colour = "black", face = "bold"),
+        legend.text = element_text(size = 12, colour = "black"),
+        legend.title = element_text(size = 14, colour = "black", face = "bold"),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        axis.ticks.y = element_line(),
+        legend.position = "top") 
+
+# sample information
+b1 <- ggplot(anno, aes(y = row, x = Patient, fill = value)) +
+  geom_tile(colour = "black") + 
+  theme_minimal()+
+  scale_fill_manual(values = meta_colours[["values"]]) +
+  theme(axis.text.x = element_blank(),
+        axis.title = element_blank(),
+        axis.text.y = element_text(size = 12, colour = "black"),
+        legend.text = element_text(size = 12, colour = "black"),
+        legend.title = element_blank(),
+        axis.ticks = element_blank(),
+        legend.position = "none",
+        legend.key.size = unit(0.4, "cm"))
+
+# number of integration breakpoints
+c1 <- ggplot(htmcpSum, aes(x = sample, y = transcribed.events)) +
+  geom_bar(stat = "identity", colour = "black", fill = "grey", size = 0.25) +
+  theme_minimal() +
+  scale_y_reverse() +
+  labs(y = "# of expressed events") +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.y = element_text(size = 12, colour = "black"),
+        axis.title.y = element_text(size = 14, colour = "black", face = "bold"),
+        legend.text = element_text(size = 12, colour = "black"),
+        legend.title = element_text(size = 14, colour = "black", face = "bold"),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        axis.ticks.y = element_line(),
+        legend.position = "none")
+
+p1 <- plot_grid(a1, b1, c1, align = "v", ncol = 1, rel_heights = c(1,1,0.2))
+ggsave(filename = "figure1/htmcp_cohort_hpvInt.pdf", plot = p1, height = 6, width = 9.5, units = "in")
+
+# save tables
+write.table(anno, file = "sourceTables/fig1a-1.txt", col.names = T, sep = "\t", row.names = F, quote = F)
+write.table(htmcpSum, file = "sourceTables/fig1a-2.txt", col.names = T, sep = "\t", row.names = F, quote = F)
+p1
+```
+
+#### Compare HIV positive and HIV negative samples
+
+Here, we check to see if HIV status influences the number of HPV breakpoints in a sample. Unfortunately, the difference is insignificant, but HIV positive samples trended higher. 
+
+```{r}
+summary$HIV.status <- htmcpMeta$HIV.status[match(summary$sample, htmcpMeta$Patient)]
+
+p2 <- ggplot(summary, aes(x = HIV.status, y = events, fill = HIV.status)) +
+    geom_boxplot(outlier.shape = NA) + 
+    geom_jitter(height = 0, width = 0.2, size = 3, alpha=0.5) +
+    theme_bw() + 
+    scale_fill_manual(values = c(Negative="black", Positive="#FACDBE")) +
+    labs(x = "HIV status", y = "# of events", fill = NULL, colour = NULL) +
+    theme(axis.text = element_text(colour = "black", size = 12),
+          axis.title = element_text(colour = "black", size = 12, face = "bold"),
+          legend.text = element_text(size = 12, colour = "black"),
+          panel.grid = element_blank(), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line(),
+          legend.position = "none")+
+    stat_compare_means(method = "wilcox.test")
+ggsave(filename = "figure1/hivStatusNEvents.pdf", plot = p2, height = 3, width = 3, units = "in")
+p2
+```
+
+#### N values for the sample metadata
+
+```{r}
+table(htmcpMeta$HPV.type) # HPV type
+
+table(htmcpMeta$HPV.clade) # HPV clade
+
+table(htmcpMeta$Stage) # Stage
+
+table(htmcpMeta$Final.histology) # histology
+
+table(htmcpMeta$Age) # Age
+
+table(htmcpMeta$HIV.status) # HIV Status
+
+table(htmcpMeta$Grade) # Grade
+
+table(htmcpMeta$HRD.score) # HRD Score
+
+table(htmcpMeta$Max.APOBEC.score) # HRD Score
+
+table(htmcpMeta$Ploidy) # Ploidy
+```
+
+```{r, include=FALSE}
+# meta table changes
+htmcpMetaSave <- htmcpMeta
+htmcpMetaSave$Age <- htmcp$Age[match(htmcpMetaSave$Patient, htmcp$Patient)]
+htmcpMetaSave$Max.APOBEC.score <- htmcp$Max.APOBEC.score[match(htmcpMetaSave$Patient, htmcp$Patient)]
+htmcpMetaSave$HRD.score <- htmcp$HRD.score[match(htmcpMetaSave$Patient, htmcp$Patient)]
+htmcpMetaSave$Ploidy <- htmcp$Ploidy[match(htmcpMetaSave$Patient, htmcp$Patient)]
+htmcpMetaSave$HPV.integrated.chromosomes <- summary$chromosomes[match(htmcpMetaSave$Patient,summary$sample)]
+
+kable(head(htmcpMetaSave))
+# save
+write.table(htmcpMetaSave, "tables/metaDataAllSamples.txt", quote = F, sep = "\t", col.names = T, row.names = F)
+
+## ---------------------------------------------------------------------------
+## Source tables
+## ---------------------------------------------------------------------------
+
+# annotation
+anno$cohort <- "HTMCP"
+write.table(anno, file = "sourceTables/fig1a-1.txt", col.names = T, sep = "\t", row.names = F, quote = F)
+
+# integration sites/events
+htmcpSum$cohort <- "HTMCP"
+sumAll <- htmcpSum[,c(1:3, 7)]
+write.table(sumAll, file = "sourceTables/fig1a-2.txt", col.names = T, sep = "\t", row.names = F, quote = F)
+```
+
+## The genomic position of HPV integration events (Figure 1)
+
+In this analysis, we are looking to see how the genomic positions of HPV integrated loci are distributed across the genome. We also want to test if the distribution is different in expressed and non-expressed events. 
+
+
+```{r, include=FALSE}
+# chromosome size files
+chromSize <- read.delim("/projects/hpv_nanopore_prj/refs/hg38_no_alt_TCGA_HTMCP_HPVs_chromSizes.txt", header = F)
+centPos <-  read.delim("/projects/hpv_nanopore_prj/refs/hg38_centromere_positions_merged.bed", header = F)
+
+# subset to the main chromosomes
+chromSize <- chromSize[chromSize$V1 %in% c(paste0("chr", 1:22), "chrX"),]
+
+# Rename columns to chromosome and size
+colnames(chromSize) <- c("chr","size")
+
+# Reorder levels for plotting
+chromSize$chr <- factor(chromSize$chr,levels=c(paste0("chr", 1:22), "chrX"))
+chromSize <- chromSize[chromSize$chr %in% c(paste0("chr", 1:22), "chrX"),]
+
+# Divide by 1Mb to clean up axis
+chromSize$size <- chromSize$size/1000000
+
+# centromere mapping
+colnames(centPos) <- c("chr", "start", "end")
+centPos$chr <- factor(centPos$chr,levels=c(paste0("chr", 1:22), "chrX"))
+centPos$centre <- centPos$start + ((centPos$end - centPos$start)/2)
+centPos$centre <- centPos$centre/1000000
+
+htmcp_path <- "/projects/hpv_nanopore_prj/htmcp/call_integration/output"
+
+# Find files
+Files1 <- grep("hpv_integration_events_distance.bed", list.files(htmcp_path, recursive = TRUE, full.names = TRUE), value = TRUE)
+Files <- c(Files1)
+
+# Extract sample names from file paths
+sample <- gsub(paste0(htmcp_path, "/|/events/hpv_integration_events_distance.bed"), "", Files)
+
+# make the data frame
+dist <- lapply(Files, read.delim, header = FALSE, sep = "\t")
+names(dist) <- sample
+dist <- dplyr::bind_rows(dist, .id = "sample")
+
+# add information from summary data feame
+dist$hpv_site <- unlist(lapply(dist$V4,function(x){strsplit(x, ",")[[1]][1]}))
+dist$event <- sum$event[match(paste0(dist$sample, dist$hpv_site), paste0(sum$sample, sum$HPV.site))]
+dist$integration.type <- intOnly$type[match(paste0(dist$sample, dist$event), paste0(intOnly$sample, intOnly$event))]
+dist$nsites <- intOnly$nsites[match(paste0(dist$sample, dist$event), paste0(intOnly$sample, intOnly$event))]
+dist$HPV.type <- intOnly$HPV.type[match(paste0(dist$sample, dist$event), paste0(intOnly$sample, intOnly$event))]
+dist$is.event.transcribed <- sum$is.event.transcribed[match(paste0(dist$sample, dist$event), paste0(sum$sample, sum$event))]
+colnames(dist)[2:5] <- c("chr", "start", "end", "sites")
+```
+
+#### Read in the integration events sorted by distance
+
+```{r}
+kable(head(dist))
+```
+
+
+```{r, include=FALSE}
+# save bed files
+multiBed <- dist[dist$integration.type == "del-like_integration",c(2,3,4,1,7,5,10)]
+multiBed <- multiBed[complete.cases(multiBed),]
+delBed <- dist[dist$integration.type == "del-like_integration",c(2,3,4,1,7,5,10)]
+delBed <- delBed[complete.cases(delBed),]
+dupBed <- dist[dist$integration.type == "dup-like_integration",c(2,3,4,1,7,5,10)]
+dupBed <- dupBed[complete.cases(dupBed),]
+traBed <- dist[dist$integration.type == "translocation_integration",c(2,3,4,1,7,5,10)]
+traBed <- traBed[complete.cases(traBed),]
+repBed <- dist[dist$integration.type == "repeat_integration",c(2,3,4,1,7,5,10)]
+repBed <- repBed[complete.cases(repBed),]
+unBed <- dist[dist$integration.type == "unmatched_integration",c(2,3,4,1,7,5,10)]
+unBed <- unBed[complete.cases(unBed),]
+
+exprBed <- dist[dist$is.event.transcribed == "yes",c(2,3,4,1,7,5,10)]
+exprBed <- exprBed[complete.cases(exprBed),]
+nonExprBed <- dist[dist$is.event.transcribed == "no",c(2,3,4,1,7,5,10)]
+nonExprBed <- nonExprBed[complete.cases(nonExprBed),]
+
+
+bedL <- list(multiBed, unBed, delBed, dupBed, traBed, repBed)
+bedLE <- list(exprBed, nonExprBed)
+
+write.table(dist[,c(2,3,4,1,7,5,10)],"tables/event_locations.bed", quote = F, sep = "\t", col.names = F, row.names = F)
+write.table(multiBed,"tables/multi-breakpoint_event_locations.bed", quote = F, sep = "\t", col.names = F, row.names = F)
+write.table(delBed,"tables/deletion_event_locations.bed", quote = F, sep = "\t", col.names = F, row.names = F)
+write.table(dupBed,"tables/duplication_event_locations.bed", quote = F, sep = "\t", col.names = F, row.names = F)
+write.table(traBed,"tables/translocation_event_locations.bed", quote = F, sep = "\t", col.names = F, row.names = F)
+write.table(repBed,"tables/repeat_event_locations.bed", quote = F, sep = "\t", col.names = F, row.names = F)
+```
+
+
+```{r, include=FALSE}
+## --------------------------------------------
+# edit dataframes
+## --------------------------------------------
+
+#### INTEGRATION TYPE
+bedL2 <- lapply(bedL, function(x){
+    colnames(x)[1:3] <- c("chr", "start", "end")
+    x$start <- x$start/1000000
+    x$end <- x$end/1000000
+    x$midpoint <- round(x$start + ((x$end - x$start)/2))
+    x <- x %>% arrange(chr, midpoint)
+    x$position <- paste0(x$chr, ":", x$midpoint)
+    return(x)
+})
+names(bedL2) <- c("multibreakpoint", "unmatched", "del-like", "dup-like", "translocation", "repeat")
+bedDF <- dplyr::bind_rows(bedL2, .id = "integration.type")
+
+hs <- bedDF %>%
+    group_by(integration.type, position) %>%
+    summarise(n = n())
+
+# split the chromosome name and bin position
+hsPlot <- separate(hs, col = position, into = c("chr", "pos"), sep = ":", remove = T)
+
+# scale to fit the plot - i.e. make the maximum width 0.65
+max <- max(hsPlot$n)
+hsPlot$percMax <- hsPlot$n/max
+hsPlot$percMax <- hsPlot$percMax * 0.65
+
+# Change to factor and reorder levels
+hsPlot$chr <- factor(hsPlot$chr, levels=c(paste0("chr", 1:22), "chrX"))
+hsPlot$pos <- as.numeric(hsPlot$pos)
+
+#### INTEGRATION EXPRESSION
+bedLE2 <- lapply(bedLE, function(x){
+    colnames(x)[1:3] <- c("chr", "start", "end")
+    x$start <- x$start/1000000
+    x$end <- x$end/1000000
+    x$midpoint <- round(x$start + ((x$end - x$start)/2))
+    x <- x %>% arrange(chr, midpoint)
+    x$position <- paste0(x$chr, ":", x$midpoint)
+    return(x)
+})
+names(bedLE2) <- c("transcribed", "not_transcribed")
+bedDF2 <- dplyr::bind_rows(bedLE2, .id = "expression")
+
+hs2 <- bedDF2 %>%
+    group_by(expression, position) %>%
+    summarise(n = n())
+
+# split the chromosome name and bin position
+hsPlot2 <- separate(hs2, col = position, into = c("chr", "pos"), sep = ":", remove = T)
+
+# scale to fit the plot - i.e. make the maximum width 0.65
+max <- max(hsPlot2$n)
+hsPlot2$percMax <- hsPlot2$n/max
+hsPlot2$percMax <- hsPlot2$percMax * 0.65
+
+# Change to factor and reorder levels
+hsPlot2$chr <- factor(hsPlot2$chr, levels=c(paste0("chr", 1:22), "chrX"))
+hsPlot2$pos <- as.numeric(hsPlot2$pos)
+
+# label positions
+adL <- data.frame(xmin = c(9.7, 9.7, 10.3), xmax = c(10.35, 9.75,10.35), ymin = c(240,238,238), ymax = c(243,243,243),
+                  fill = c("ase","ase","ase"))
+
+adW <- data.frame(x = c(11.5,10), y = c(240,250),
+                  label = c("# of integration events", as.character(c(max))))
+```
+
+#### Plot the karyogram
+
+```{r}
+p1 <- ggplot() +
+    # chromosome bars
+    geom_segment(data = chromSize %>% filter(chr %in% paste0("chr", 1:12)), aes(x = chr, xend = chr, y = 0, yend = size), 
+                 lineend = "round", color = "lightgrey", size = 4) +
+    # centromeres
+    geom_point(data = centPos %>% filter(chr %in% paste0("chr", 1:12)), aes(x = chr, y = centre), 
+               size = 4, colour = "black") +
+    # integration types
+    geom_rect(data = hsPlot2 %>% filter(chr %in% paste0("chr", 1:12)), 
+              aes(xmin = as.integer(chr) + 0.1, xmax = (as.integer(chr) + 0.1 + percMax), ymin = pos, ymax = pos+3, fill = expression),
+              size = 1) +
+    # expression
+    #geom_rect(data = hsPlot2 %>% filter(chr %in% paste0("chr", 1:12)), 
+    #          aes(xmax = as.integer(chr) - 0.1, xmin = (as.integer(chr) - 0.1 - percMax), ymin = pos, ymax = pos+3, fill = expression),
+    #          size = 1) +
+    # legend bars
+    geom_rect(data = adL, 
+              aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+              fill = "black", size = 0.15) +
+    # legend text
+    geom_text(data = adW, 
+              aes(x = x, y = y, label = label))+
+    ylim(0, 250) +
+    scale_fill_manual(values = c("#8d99ae", "#fb8500"))+
+    #scale_fill_manual(values = c("#118ab2","#ef476f","#ffd166","#8d99ae","#06d6a0", "red","#caadff","black"))+
+    theme_classic() +
+    theme(text = element_text(size=15),axis.line=element_blank(),
+          axis.ticks.x=element_blank())+
+    labs(x=NULL,y="Chromosome Size (Mb)")
+
+# very annoying but you have to filter all the dataframes or else the factor levels won't match the integer value
+chromSizeFilt <- chromSize %>% filter(chr %in% c(paste0("chr", 13:22), "chrX"))
+chromSizeFilt$chr <- factor(chromSizeFilt$chr,levels=c(paste0("chr", 13:22), "chrX"))
+centPosFilt <- centPos %>% filter(chr %in% c(paste0("chr", 13:22), "chrX"))
+hsPlotFilt <- hsPlot %>% filter(chr %in% c(paste0("chr", 13:22), "chrX"))
+hsPlotFilt$chr <- factor(hsPlotFilt$chr,levels=c(paste0("chr", 13:22), "chrX"))
+hsPlot2Filt <- hsPlot2 %>% filter(chr %in% c(paste0("chr", 13:22), "chrX"))
+hsPlot2Filt$chr <- factor(hsPlot2Filt$chr,levels=c(paste0("chr", 13:22), "chrX"))
+
+p2 <- ggplot() +
+    # chromosome bars
+    geom_segment(data = chromSizeFilt, aes(x = chr, xend = chr, y = 0, yend = size), 
+                 lineend = "round", color = "lightgrey", size = 4) +
+    # centromeres
+    geom_point(data = centPosFilt, aes(x = chr, y = centre), 
+               size = 4, colour = "black") +
+    # ASE genes
+    geom_rect(data = hsPlot2Filt, 
+              aes(xmin = as.integer(chr) + 0.1, xmax = (as.integer(chr) + 0.1 + percMax), ymin = pos, ymax = pos+3, fill = expression),
+              size = 1) +
+    #geom_rect(data = hsPlot2Filt, 
+    #          aes(xmax = as.integer(chr) - 0.1, xmin = (as.integer(chr) - 0.1 - percMax), ymin = pos, ymax = pos+3, fill = expression),
+    #          size = 1) +
+    ylim(0, 250) +
+    scale_fill_manual(values = c("#8d99ae", "#fb8500"))+
+    #scale_fill_manual(values = c("#118ab2","#ef476f","#ffd166","#8d99ae","#06d6a0", "red","#caadff","grey"))+
+    theme_classic() +
+    theme(text = element_text(size=15),axis.line=element_blank(),
+          axis.ticks.x=element_blank())+
+    labs(x=NULL,y="Chromosome Size (Mb)")
+
+# put them together
+plot <- plot_grid(p1, p2, align = "v", axis = "l", nrow = 2)
+
+# save plot
+ggsave(plot, filename = "figure1/position_events_karyograph.pdf", width = 10, height = 7, units = "in")
+plot
+```
+
+## Test expression in genes nearby HPV integration at integration "hotspots"
+
+Across the genome there were three regions that had HPV integrated multiple times, and this included loci containing TP63, MYC, and KLF5/KLF12, respectively. We want to test and see if the the expression of these genes is higher in the integrated samples than in unintegrated samples. 
+
+```{r, include=FALSE}
+## --------------------------------------------------------------------------------------
+## Load in the expression matrices
+## --------------------------------------------------------------------------------------
+htmcp_mat <- read.delim("/projects/hpv_nanopore_prj/htmcp/gdc_gene_expression/HTMCP_GDC_TPM-unstranded_matrix.rm-dups.txt", header = T)
+allgenes <- read.delim("/projects/hpv_nanopore_prj/htmcp/call_integration/tables/event_locations_1Mb_window_genes.bed", header = F)
+colnames(allgenes) <- c("chr", "start", "end","hpv.sites", "gene.chr", "gene.start", "gene.end", "gene.id", "strand", "locus", "gene.type", "chr.locus")
+
+# sample information
+allgenes$sample <- sum$sample[match(paste0(allgenes$chr, allgenes$start), paste0(sum$chr, sum$pos))]
+
+# select the samples in the cohort
+samples_list <- read.delim("/projects/hpv_nanopore_prj/htmcp/call_integration/output/ran_libraries.txt", header = F)
+
+# subset the matrix
+samples_list$V1 <- gsub("-",".",samples_list$V1)
+colnames(htmcp_mat) <- gsub("(.*\\.[0-9]+\\.[0-9]+\\.[0-9]+)\\.[0-9]+$", "\\1", colnames(htmcp_mat))
+htmcp_mat_sub <- htmcp_mat[,colnames(htmcp_mat)[colnames(htmcp_mat) %in% c("gene.id",samples_list$V1)]]
+
+kable(head(allgenes))
+
+# save genes
+write.table(allgenes,"tables/event_locations_1Mb_genes.bed", quote = F, sep = "\t", col.names = T, row.names = F)
+```
+
+#### Test for recurrently integrated genes
+
+Here, we are looking for the loci with recurrent (>3) integration across our samples. 
+
+```{r}
+## --------------------------------------------------------------------------------------
+## Genes with > 3 events nearby
+## --------------------------------------------------------------------------------------
+# Genes with >3 samples integrated nearby
+nint <- sort(table(as.factor(allgenes$gene.id)), decreasing = T)
+nint <- nint[nint > 3]
+print(nint)
+
+# recurrently integrated loci
+multiGenes <- allgenes[allgenes$gene.id %in% names(nint),]
+multiLoci <- unique(multiGenes$chr.locus)
+print(multiLoci)
+```
+
+#### Test expression in recurrently integrated genes
+
+The genes KLF5, TP63, and MYC, all have HPV recurrently integrated nearby. Here we test the expression levels of integrated samples for each. 
+
+```{r}
+## --------------------------------------------------------------------------------------
+## Test specific genes
+## --------------------------------------------------------------------------------------
+
+#gene <- c("MYC")
+gene <- c("KLF5")
+test_sample <- unique(gsub("-", ".",allgenes$sample[allgenes$gene.id %in% gene]))
+expr_mat <- htmcp_mat_sub
+
+p1 <- expr_mat %>%
+  filter(gene.id %in% gene) %>%
+  gather(sample, tpm,-gene.id) %>%
+  mutate(colour = ifelse(sample %in% test_sample, "test", "others")) %>%
+  ggplot(aes(x = colour, y = log10(tpm), colour = colour)) +
+    geom_boxplot(outlier.shape = NA, position = "dodge") +
+    geom_jitter(aes(colour = colour, x = colour), height = 0, width = 0.2, size =3, alpha=0.5) +
+    facet_grid(~ gene.id) +
+    stat_compare_means(method = "wilcox.test") +
+    labs(x = NULL, y = "log10(TPM)") +
+    scale_colour_manual(values = c("grey", "dark red")) +
+    theme_minimal() +
+    theme(panel.grid = element_blank(), 
+          axis.text = element_text(size = 13),
+          axis.title = element_text(size=14), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line(), 
+          legend.position = "none")
+
+gene <- c("MYC")
+test_sample <- unique(gsub("-", ".",allgenes$sample[allgenes$gene.id %in% gene]))
+expr_mat <- htmcp_mat_sub
+
+p2 <- expr_mat %>%
+  filter(gene.id %in% gene) %>%
+  gather(sample, tpm,-gene.id) %>%
+  mutate(colour = ifelse(sample %in% test_sample, "test", "others")) %>%
+  ggplot(aes(x = colour, y = log10(tpm), colour = colour)) +
+    geom_boxplot(outlier.shape = NA, position = "dodge") +
+    geom_jitter(aes(colour = colour, x = colour), height = 0, width = 0.2, size =3, alpha=0.5) +
+    facet_grid(~ gene.id) +
+    stat_compare_means(method = "wilcox.test") +
+    labs(x = NULL, y = "log10(TPM)") +
+    scale_colour_manual(values = c("grey", "dark red")) +
+    theme_minimal() +
+    theme(panel.grid = element_blank(), 
+          axis.text = element_text(size = 13),
+          axis.title = element_text(size=14), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line(), 
+          legend.position = "none")
+
+gene <- c("TP63")
+test_sample <- gsub("-", ".",allgenes$sample[allgenes$gene.id == gene])
+expr_mat <- htmcp_mat_sub
+
+p3 <- expr_mat %>%
+  filter(gene.id == gene) %>%
+  gather(sample, tpm,-gene.id) %>%
+  mutate(colour = ifelse(sample %in% test_sample, "test", "others")) %>%
+  ggplot(aes(x = colour, y = log10(tpm), colour = colour)) +
+  geom_boxplot(outlier.shape = NA, position = "dodge") +
+    stat_compare_means(method = "wilcox.test") +
+  geom_jitter(aes(colour = colour, x = colour), height = 0, width = 0.2, size =3, alpha=0.5) +
+    labs(x = NULL, y = "log10(TPM)") +
+  scale_colour_manual(values = c("grey", "dark red")) +
+    theme_minimal() +
+    theme(panel.grid = element_blank(), 
+          axis.text = element_text(size = 13),
+          axis.title = element_text(size=14), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line(), 
+          legend.position = "none")
+
+ggsave(plot = p1, filename = paste0("figure1/KLF5_integrated_vs_not_integrated.pdf"), width = 2.7, height = 2.7)
+ggsave(plot = p2, filename = paste0("figure1/MYC_integrated_vs_not_integrated.pdf"), width = 2.7, height = 2.7)
+ggsave(plot = p3, filename = paste0("figure1/TP63_integrated_vs_not_integrated.pdf"), width = 2.7, height = 2.7)
+
+p1
+p2
+p3
+```
+
+## ONT Sequencing Statistics
+
+```{r, include=FALSE}
+# stats QC table
+stats <- read.delim("input_tables/htmcp_qc_stats_per_fc_2024_07_22.tsv", header = T)
+stats$coverage <- stats$read_length_sum/3049315783 # length of hg38 genome
+
+# sample name conversion
+snames <- read.delim("input_tables/htmcp_sample_names.txt", header = T)
+snames$Biospecimen.ID <- sub("-[0-9A-Z]{3}-[0-9A-Z]{3}$", "", snames$Biospecimen.ID)
+
+# dataset samples
+allSampleList <- as.character(sumAll$sample)
+
+# get the sample names for ONT patient IDs
+sampleID <- snames$GSC.original.source.ID[snames$Tissue.Site == "Cervix" & snames$Biospecimen.ID %in% allSampleList]
+
+# filter the stats df for the samples in the list
+statsFilt <- stats %>% filter(original_source %in% sampleID)
+statsFilt <- statsFilt[-grep("I", statsFilt$lib),]
+
+dataLong <- melt(statsFilt[,c("lib", "coverage", "read_length_sum","n50", "read_length_median", "chimerism_prop", "error_rate_by_qualimap")], id.vars = "lib")
+
+## ---------------------------------------------------------------------------
+## Get the duplicate QC stats
+## ---------------------------------------------------------------------------
+
+dups <- statsFilt$lib[duplicated(statsFilt$lib)]
+
+mergeQCfiles <- list.files("/projects/hpv_nanopore_prj/htmcp/nanopore_qc_stats/merged_data", full.names = T)
+mergeQCnames <- gsub("/projects/hpv_nanopore_prj/htmcp/nanopore_qc_stats/merged_data/|.csv", "", mergeQCfiles)
+
+mergeQC <- lapply(mergeQCfiles, read.csv, header = TRUE)
+names(mergeQC) <- mergeQCnames
+mergeQC <- bind_rows(mergeQC, .id = "library")
+mergeQC <- mergeQC[mergeQC$X_key == "pass",]
+mergeQC$coverage <- mergeQC$sum / 3088269832
+mergeQC$chimerism_prop <- NA
+mergeQC$error_rate_by_qualimap <- NA
+
+mergeQCsub <- mergeQC %>% select("library", "coverage", "sum","n50", "median", "chimerism_prop", "error_rate_by_qualimap")
+colnames(mergeQCsub) <- c("lib", "coverage", "read_length_sum",
+                          "n50", "read_length_median", 
+                          "chimerism_prop", "error_rate_by_qualimap")
+
+mergeQCsub <- mergeQCsub %>% filter(lib %in% c(dups,"D77540-D81468", "D77541-D81469"))
+
+mergeDataLong <- melt(mergeQCsub, id.vars = c("lib"))
+
+# duplicated samples
+dupsS <- statsFilt$original_source[duplicated(statsFilt$original_source)]
+
+# merge together
+dataLong <- dataLong %>% filter(!lib %in% c(dups,"D77540","D81468", "D77541","D81469","F47354","F47778"))
+datasubLong <- rbind(mergeDataLong,dataLong)
+datasubLong$cohort <- "HTMCP"
+
+## ---------------------------------------------------------------------------
+## Save table
+## ---------------------------------------------------------------------------
+
+datasubWide <- datasubLong %>%
+  pivot_wider(names_from = variable, values_from = value)
+
+write.table(datasubWide, file = "tables/qcStats.txt", quote = F, col.names = T, row.names = F, sep = "\t")
+```
+
+#### Stats for paper
+
+```{r}
+## ---------------------------------------------------------------------------
+## Stats
+## ---------------------------------------------------------------------------
+
+# coverage
+mean(datasubLong$value[datasubLong$variable == "read_length_sum"])/1000000000 # average yield
+range(datasubLong$value[datasubLong$variable == "read_length_sum"])/1000000000 # range of yield
+median(datasubLong$value[datasubLong$variable == "coverage"]) # median coverage
+range(datasubLong$value[datasubLong$variable == "coverage"]) # range of  coverage
+
+# N50
+median(datasubLong$value[datasubLong$variable == "n50"])/1000 # median N50
+range(datasubLong$value[datasubLong$variable == "n50"])/1000 # range of N50
+
+# chimera
+median(datasubLong$value[datasubLong$variable == "chimerism_prop"], na.rm = TRUE) # median chimeria rate
+range(datasubLong$value[datasubLong$variable == "chimerism_prop"],na.rm = TRUE) # range chimeria rate
+
+# error_rate_by_qualimap
+median(datasubLong$value[datasubLong$variable == "error_rate_by_qualimap"],na.rm = TRUE) # median error rate
+range(datasubLong$value[datasubLong$variable == "error_rate_by_qualimap"],na.rm = TRUE) # range error rate
+```
+#### make figures
+
+```{r}
+## ---------------------------------------------------------------------------
+## Make figures
+## ---------------------------------------------------------------------------
+
+p <- ggplot(datasubLong, aes(y = value, x = cohort, fill = cohort)) + 
+  geom_boxplot(outlier.shape = NA) + 
+  geom_jitter(height = 0, width = 0.2, size =2, alpha=0.5) +
+  facet_wrap(~ variable, nrow = 1, scales = "free") +
+  scale_fill_manual(values = c("#DD4A48", "#C0D8C0")) +
+  theme_bw() + 
+  labs(x = NULL, y = NULL, fill = NULL, colour = NULL) +
+  theme(axis.text.y = element_text(colour = "black", size = 13),
+        axis.text.x = element_blank(),
+        axis.title = element_text(colour = "black", size = 14),
+        legend.text = element_text(size = 12, colour = "black"),
+        panel.grid = element_blank(), 
+        panel.background = element_rect(fill = "white", colour = "black", size = 0.75),
+        axis.ticks.y = element_line(),
+        axis.ticks.x = element_blank(),
+        strip.text = element_text(size = 12, colour = "black"),
+        strip.background = element_rect(fill = "#F5EEDC", colour = "black", size = 0.75))
+ggsave(p, file = "supp_figures/suppFig1.pdf", width = 10, height = 3)
+p
+```
+
+
+## HPV Integrant Analysis (Figure 2)
+In this section, the breakpoint positions on the reads are used to summarize the integrant structures, as preseneted in Figure 2. 
+
+```{r, include=FALSE}
+### -------------------------------------------------------------------------------
+### READ IN FILES 
+### -------------------------------------------------------------------------------
+
+### CATEGORIES
+
+f <- grep("hpvSizeCategories.txt", list.files("/projects/hpv_nanopore_prj/htmcp/call_integration/output", recursive = T, full.names = T), value = T)
+n <- gsub("/projects/hpv_nanopore_prj/htmcp/call_integration/output/|/hpv_size/hpvSizeCategories.txt", "", f)
+
+list <- list()
+for (i in 1:length(f)) {
+    df <- read.delim(f[i], header = T)
+    list[[i]] <- df
+}
+names(list) <- n
+cat <- bind_rows(list, .id = "sample")
+
+### -------------------------------------------------------------------------------
+### ADD THE INTEGRATION CATEGORIES
+### -------------------------------------------------------------------------------
+
+int <- intOnly
+cat$bp1 <- gsub("\\_.*","",cat$bp_pair)
+sum$bp <- paste0(sum$chr, ":", sum$pos)
+
+# add the info to the df
+cat$event <- sum$event[match(cat$bp1, sum$bp)]
+cat$integration_type <- int$type[match(paste0(cat$sample, cat$event), paste0(int$sample, int$event))]
+cat$integration_type[is.na(cat$integration_type)] <- "unmatched_integration"
+cat$HPV.type <- sum$HPVchr[match(paste0(cat$sample, cat$event), paste0(sum$sample, sum$event))]
+
+cat <- cat[complete.cases(cat),]
+catC <- cat[cat$status == "complete",]
+
+write.table(cat, file = "tables/integrantBreakpairs.txt", quote = F, col.names = T, row.names = F, sep = "\t")
+
+kable(head(catC))
+```
+
+
+```{r, include=FALSE}
+ann_colors <- list(HPV.clade = c(A7="#B55F8F", A9="#253083", Other="#A9A9A9"),
+                   HPV.type = c(HPV16="#3953A4", HPV18="#9768ad", HPV45="#CC138C", HPV82="#369797",
+                                HPV52="#0B8DCD", HPV31="#d2ecf9", HPV73="#737474", HPV68="#f3b2d4", HPV97="black", HPV58="#8bafba", HPV59="#ae3030"))
+```
+
+#### Compare the HPV integrant size between HPV16 and HPV18
+
+```{r}
+p1 <- ggplot(catC %>% filter(HPV.type %in% c("HPV16", "HPV18")), aes(x = HPV.type, colour = HPV.type, y = max_nHPV))+
+    geom_boxplot(outlier.shape = NA) + 
+    geom_jitter(height = 0, width = 0.2, size =3, alpha=0.5) +
+    theme_minimal() +
+    xlab("HPV type") + 
+    ylab("max # of HPV genomes in integrant") +
+    scale_colour_manual(values = c(ann_colors[["HPV.type"]])) +
+    theme(panel.grid = element_blank(), 
+          axis.text = element_text(size = 12,colour = "black"),
+          axis.title = element_text(size=12, face = "bold", colour = "black"), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line(), 
+          legend.position = "none") +
+    stat_compare_means(method = "wilcox")
+ggsave(p1, file="figure2/HPV16vsHPV18.pdf", height = 3, width = 3)
+p1
+```
+
+#### Integration types with heterologous integration
+
+```{r}
+catC$category_simple <- ifelse(catC$category %in% c("partial", "full"), "single", "heterologous")
+catC$integration_type <- factor(catC$integration_type, levels = c("multi-breakpoint_integration","repeat_integration",
+                                                                  "del-like_integration","dup-like_integration",
+                                                                  "translocation_integration"))
+
+# integration type
+p2 <- ggplot(catC %>% filter(category_simple == "heterologous"), aes(x = integration_type))+
+    geom_bar() + 
+    theme_minimal() +
+    xlab("integration type") + 
+    ylab("# of heterologous integrants") +
+    #scale_colour_manual(values = c(ann_colors[["HPV.type"]])) +
+    theme(panel.grid = element_blank(), 
+          axis.text.y = element_text(size = 12,colour = "black"),
+          axis.text.x = element_text(size = 12,colour = "black", angle = 60, hjust = 1, vjust = 1),
+          axis.title = element_text(size=12, face = "bold", colour = "black"), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line())
+p2
+ggsave(p2, file="figure2/fig2f.pdf", height = 4.5, width = 3.2)
+p2
+```
+
+#### HPV18 vs Other HPVs
+
+```{r}
+catC$all <- "all"
+catC$HPV18_vs_all <- ifelse(catC$HPV.type == "HPV18", "HPV18", "Other_HPV")
+# integration type
+p3 <- ggplot(catC, aes(x = HPV18_vs_all, fill = category_simple))+
+    geom_bar(position="fill", colour = "black") + 
+    theme_minimal() +
+    xlab("integration type") + 
+    ylab("% of integrants") +
+    labs(fill = NULL) +
+    scale_fill_manual(values = c("#219ebc","#ffb703")) +
+    theme(panel.grid = element_blank(), 
+          axis.text.y = element_text(size = 12,colour = "black"),
+          axis.text.x = element_text(size = 12,colour = "black", angle = 60, hjust = 1, vjust = 1),
+          legend.text = element_text(size = 12,colour = "black"),
+          axis.title = element_text(size=12, face = "bold", colour = "black"), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line())
+ggsave(p3, file="figure2/fig2h.pdf", height = 3.2, width = 4.5)
+p3
+```
+
+#### Integration types sizes
+
+```{r}
+p4 <- ggplot(catC, aes(x = integration_type, y = max_nHPV))+
+    geom_boxplot(outlier.shape = NA) + 
+    geom_jitter(height = 0, width = 0.2, size =2, alpha=0.5, colour = "dark grey") +
+    theme_minimal() +
+    xlab("integration type") + 
+    ylab("max # of HPV genomes in integrant") +
+    #scale_colour_manual(values = c(ann_colors[["HPV.type"]])) +
+    theme(panel.grid = element_blank(), 
+          axis.text.y = element_text(size = 12,colour = "black"),
+          axis.text.x = element_text(size = 12,colour = "black", angle = 60, hjust = 1, vjust = 1),
+          axis.title = element_text(size=12, face = "bold", colour = "black"), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line(), 
+          legend.position = "none") 
+ggsave(p4, file="figure2/fig2g.pdf", height = 5.5, width = 5.5)
+p4
+```
+
+#### Number of HPV integrant sizes per breakpoint pair
+
+```{r}
+p5 <- ggplot(catC, aes(x = as.factor(ngroups), fill = category_simple))+
+    geom_bar(colour = "black") + 
+    theme_minimal() +
+    xlab("# of integrant structures") + 
+    ylab("# of breakpoint pairs") +
+    labs(fill = NULL) +
+    scale_fill_manual(values = c("#219ebc","#ffb703")) +
+    theme(panel.grid = element_blank(), 
+          axis.text.y = element_text(size = 12,colour = "black"),
+          axis.text.x = element_text(size = 12,colour = "black"),
+          legend.text = element_text(size = 12,colour = "black"),
+          axis.title = element_text(size=12, face = "bold", colour = "black"), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line())
+ggsave(p5, file="figure2/fig2c.pdf", height = 2.5, width = 6)
+p5
+```
+
+#### Size of incomplete integrants
+
+```{r}
+catI <- cat[cat$status == "incomplete",]
+
+p6 <- ggplot(catI, aes(x = max_length/1000))+
+    geom_histogram(colour = "black", size = 0.5) + 
+    theme_minimal() +
+    xlab("max length of incomplete HPV integrant (bp)") + 
+    ylab("count") +
+    labs(fill = NULL) +
+    theme(panel.grid.minor = element_blank(), 
+          axis.text.y = element_text(size = 12,colour = "black"),
+          axis.text.x = element_text(size = 12,colour = "black"),
+          legend.text = element_text(size = 12,colour = "black"),
+          axis.title = element_text(size=12, face = "bold", colour = "black"), 
+          axis.ticks.y = element_line(),
+          axis.ticks.x = element_line(),
+          axis.line = element_line())
+ggsave(p6, file="figure2/fig2j.pdf", height = 4, width = 4)
+p6
+```
+
+#### Stats on integrants
+
+```{r}
+### -------------------------------------------------------------------------------
+### GET STATS ON THE INTEGRANTS
+### -------------------------------------------------------------------------------
+
+# Longest integrant
+head(cat %>% arrange(desc(max_nHPV)), 1)
+head(cat %>% filter(status == "complete") %>% arrange(desc(max_nHPV)), 1)
+
+# complete integrants
+table(catC$integration_type)
+table(catC$HPV.type)
+
+# percent heterologous
+table(catC$category)
+table(catC$category_simple)
+table(catC$HPV18_vs_all)
+table(catC$category)/sum(table(catC$category))
+
+fisher.test(matrix(c(nrow(catC[catC$HPV.type != "HPV18" & catC$category == "heterologous",]),
+                     nrow(catC[catC$HPV.type == "HPV18" & catC$category == "heterologous",]),
+                     nrow(catC[catC$HPV.type != "HPV18" & catC$category != "heterologous",]),
+                     nrow(catC[catC$HPV.type == "HPV18" & catC$category != "heterologous",])),byrow = T, ncol=2))
+
+# heterologous 
+catCH <- catC %>% filter(category == "heterologous")
+table(catCH$integration_type)
+table(catCH$HPV.type)
+table(catCH$integration_type)/sum(table(catCH$integration_type))
+
+# heterologous per HPV type
+table(catC$category[catC$HPV.type == "HPV16"])/sum(table(catC$category[catC$HPV.type == "HPV16"]))
+table(catC$category_simple[catC$HPV.type == "HPV18"])/sum(table(catC$category_simple[catC$HPV.type == "HPV18"]))
+table(catC$category[catC$HPV.type != "HPV18"])/sum(table(catC$category[catC$HPV.type != "HPV18"]))
+
+table(catC$category_simple)/sum(table(catC$category_simple))
+
+# length per HPV type
+catC %>%
+  group_by(HPV.type) %>%
+  summarise(mean = mean(max_nHPV))
+
+catC %>%
+  group_by(HPV.type) %>%
+  summarise(mean = mean(max_nHPV))
+
+# number of incomplete breakpoints
+table(cat$category)
+table(cat$HPV.type[cat$category == "incomplete"])
+
+# largest integrants
+max(cat$max_nHPV[cat$category == "incomplete"])
+max(cat$max_length[cat$category == "incomplete"])
+max(catC$max_nHPV)
+max(catC$max_length)
+
+# incomplete integrants
+mean(catI$max_nHPV)
+mean(catI$max_length)
+table(catI$HPV.type)
+```
+
+### HPV Episome Sizes
+
+```{r episome, include=FALSE}
+
+### -------------------------------------------------------------------------------
+### READ IN FILES 
+### -------------------------------------------------------------------------------
+
+# FILES
+f <- grep("hpv_reads.paf", list.files("/projects/hpv_nanopore_prj/htmcp/call_integration/output", recursive = T, full.names = T), value = T)
+
+# FIND THE SAMPLES WITHOUT INTEGRATION
+noInt <- sum$sample[sum$integration_type == "no_detected_integration"]
+f <- grep(paste(c(noInt,"HTMCP-03-06-02205"),collapse="|"), f, value = T)
+n <- gsub("/projects/hpv_nanopore_prj/|tcga|htmcp|/call_integration/output/|/bam/hpv_reads.paf", "", f)
+
+# READ FILES IN AND SUBSET
+list <- list()
+for (i in 1:length(f)) {
+    df <- read_paf(f[i])
+    list[[i]] <- df
+}
+names(list) <- n
+paf <- bind_rows(list, .id = "sample")
+
+### -------------------------------------------------------------------------------
+### CREATE THE GROUPS
+### -------------------------------------------------------------------------------
+
+```
+
+```{r}
+sub <- paf %>%
+    select(sample, qname, qlen) %>%
+    filter(!duplicated(qname))
+
+p <- ggplot(sub, aes(x = qlen)) +
+    geom_vline(xintercept = 7900, colour = "red", linetype = 2, alpha = 0.5)+
+    geom_vline(xintercept = 15800, colour = "red", linetype = 2, alpha = 0.5) +
+    geom_vline(xintercept = 23700, colour = "red", linetype = 2, alpha = 0.5)+
+    geom_vline(xintercept = 31600, colour = "red", linetype = 2, alpha = 0.5)+
+    geom_histogram(binwidth = 100, colour = "black") +
+    facet_wrap(sample ~ ., scales = "free_y", ncol = 2) +
+    xlim(0,60000) +
+    theme_bw() +
+    theme(axis.text = element_text(size = 11, colour = "black"),
+          axis.title = element_text(size = 13, colour = "black", face = "bold"))
+pg <- ggplot_build(p)
+p_df <- pg[["data"]][[5]]
+ggsave(filename = "figure2/fig2e_episome_sizes.pdf", plot = p, height = 4, width = 7.5)
+p
+```
+
+
+## Two-breakpoint events (del-like and dup-like, Figure 3)
+
+
+```{r,}
+summaryTwo <- summary1[summary1$n == 2,]
+summaryTwo$dist <- NA
+
+for (i in summaryTwo$sample) {
+  for (j in summaryTwo$event) {
+    breaks <- sum$pos[sum$sample == i & sum$event == j]
+    distance <- max(breaks) - min(breaks)
+    summaryTwo$dist[summaryTwo$sample == i & summaryTwo$event == j] <- distance
+  }
+}
+summaryTwo$intType <- intOnly$type[match(paste0(summaryTwo$sample, summaryTwo$event), paste0(intOnly$sample, intOnly$event))]
+summaryTwo_sub <- summaryTwo[summaryTwo$intType %in% c("dup-like_integration", "del-like_integration"),]
+summaryTwo_sub$intType <- gsub("_integration", "", summaryTwo_sub$intType)
+
+# stat test
+wilcox.test(dist ~ intType,
+             data = summaryTwo_sub)
+
+table(summaryTwo_sub$intType)
+```
+#### eccDNA
+
+```{r, include=FALSE}
+# List all files 
+ecDNAFiles <- grep("intTest3.txt", list.files(dir1, recursive = T, full.names = T), value = T)
+
+# Extract sample names from the file paths
+ecDNAnames <- gsub(paste0(dir1, "/|intType/|/intTest3.txt"), "", ecDNAFiles)
+
+# Read data from all files and store in a list
+ec_list <- lapply(ecDNAFiles, read.delim, header=F)
+
+# Set names for the list elements based on sample names
+names(ec_list) <- ecDNAnames
+
+# Combine the dataframes in the list into a single dataframe, adding an "event" column
+ecAll <- bind_rows(ec_list, .id = "id")
+ecOnly <- ecAll %>% filter(V1 == "ecDNA_detected")
+ecOnly <- separate(ecOnly, id, into = c("sample", "event"), sep = "/", remove = F)
+
+# get info from the assembly
+asmPath <- paste0(dir1,"/", ecOnly$sample,"/asm/",ecOnly$event,"/assembly_info.txt")
+asm_list <- lapply(asmPath, read.delim, header=T)
+names(asm_list) <- ecOnly$id
+asm_list <- lapply(asm_list, function(x){x %>% select(-graph_path) %>% filter(circ. == "Y")})
+asm <- bind_rows(asm_list, .id = "id")
+
+# add assembly info
+ecOnly$size <- asm$length
+ecOnly$nreads <- asm$cov.
+ecOnly$integration_type <- intOnly$type[match(ecOnly$id, paste0(intOnly$sample, "/", intOnly$event))]
+ecOnly$HPV.type <- intOnly$HPV.type[match(ecOnly$id, paste0(intOnly$sample, "/", intOnly$event))]
+ecOnly$is.event.transcribed <- intOnly$is.event.transcribed[match(ecOnly$id, paste0(intOnly$sample, "/", intOnly$event))]
+
+write.table(ecOnly, file = "tables/eccDNA_info.txt", quote = F, col.names = T, row.names = F, sep = "\t")
+```
+
+
+Show the sizes of the potential eccDNAs
+
+```{r}
+kable(ecOnly)
+
+pEcSize <- ggplot(ecOnly, aes(x = size)) +
+    geom_histogram() + 
+    #geom_vline(aes(xintercept = size), linetype = 2) + 
+    theme_minimal() +
+    xlab("size of eccDNA (bp)") +
+    xlim(0,100000)+
+    #scale_colour_manual(values = c(ann_colors[["HPV.type"]])) +
+    theme(panel.grid = element_blank(), 
+          axis.text.y = element_text(size = 12,colour = "black"),
+          axis.text.x = element_text(size = 12,colour = "black", angle = 60, hjust = 1, vjust = 1),
+          axis.title = element_text(size=12, face = "bold", colour = "black"), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line(), 
+          legend.position = "none") 
+pEcSize
+
+ggsave(filename = "figure3/eccDNA_sizes.pdf", plot = pEcSize, height = 3, width = 5)
+
+```
+
+#### The del-like vs. dup-like distances
+
+```{r}
+## figure
+p3 <- ggplot(summaryTwo_sub, aes(x = intType, y = dist, fill = intType)) +
+  geom_boxplot(outlier.shape = NA) + 
+  geom_jitter(height = 0, width = 0.2, size = 3, alpha=0.5) +
+  theme_bw() + 
+  scale_fill_manual(values = c("#DD4A48", "#C0D8C0", "#f5eedc")) +
+  scale_y_log10() +
+  labs(x = "Two breakpoint integration types", y = "log10(distance between breakpoints)", fill = NULL, colour = NULL) +
+  theme(axis.text = element_text(colour = "black", size = 12),
+        axis.title = element_text(colour = "black", size = 12, face = "bold"),
+        legend.text = element_text(size = 12, colour = "black"),
+        panel.grid = element_blank(), 
+        axis.ticks.y = element_line(),
+        axis.line = element_line(),
+        legend.position = "none")+
+  stat_compare_means(method = "wilcox.test")
+ggsave(filename = "figure3/twoBreakBoxplot.pdf", plot = p3, height = 5, width = 5, units = "in")
+p3
+```
+
+#### Regional differences between del-like and dup-like
+
+```{r}
+## -------------------------------------------------------------------------
+## genic region of two-break events
+## -------------------------------------------------------------------------
+
+dir1 <- "/projects/hpv_nanopore_prj/htmcp/call_integration/output/"
+files1 <- grep("genic_test/event_location.txt",list.files(dir1, recursive = T), value = T)
+name1 <- gsub("intType/", "", files1)
+name1 <- gsub("/genic_test/event_location.txt", "", name1)
+
+reg1 <- NULL
+for (i in 1:length(files1)) {
+  reg1[[i]] <- read.delim(paste0(dir1, files1[i]), header = F)
+}
+names(reg1) <- name1
+reg1 <- bind_rows(reg1, .id = "event")
+reg <- reg1
+reg <- reg %>% separate(event, c("sample", "event"), sep = "/")
+
+# put together with the summaryTwo
+summaryTwo_sub$region <- reg$V1[match(paste0(summaryTwo_sub$sample, summaryTwo_sub$event), paste0(reg$sample, reg$event))]
+
+## figure
+p4 <- ggplot(summaryTwo_sub, aes(x= region,  group=intType)) + 
+  geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat="count", colour = "black") +
+  geom_text(aes( label = scales::percent(..prop..),
+                 y= ..prop.. ), stat= "count", vjust = -.5) +
+  labs(y = "% of events", fill=NULL, x = "genomic region") +
+    scale_fill_manual(values = c("#f5cac3", "#84a59d", "#f28482")) +
+  theme_minimal()+
+  facet_grid(~intType) +
+  scale_y_continuous(labels = scales::percent) +
+  theme(axis.text.y = element_text(colour = "black", size = 12),
+        axis.text.x = element_text(colour = "black", size = 12, hjust = 1, angle = 45),
+        axis.title = element_text(colour = "black", size = 12, face = "bold"),
+        strip.text = element_text(colour = "black", size = 12, face = "bold"),
+        legend.text = element_text(size = 12, colour = "black"),
+        panel.grid = element_blank(), 
+        axis.ticks.y = element_line(),
+        axis.line = element_line(),
+        legend.position = "none")
+ggsave(filename = "figure3/twoBreakEventRegion.pdf", plot = p4, height = 4, width = 7, units = "in")
+p4
+
+## p value test between ecDNA vs. deletions/duplications
+mat <- summaryTwo_sub %>%
+  group_by(intType, region) %>%
+  summarise(n = n())
+
+## save table
+write.table(summaryTwo_sub, file = "tables/twoBreakIntegrationCharacteristics.txt", quote = F, sep = "\t", col.names = T, row.names = F)
+
+kable(head(summaryTwo_sub))
+
+# n vals
+table(summaryTwo_sub$intType)
+
+mat <- as.data.frame(spread(mat, key = intType, value = n))
+rownames(mat) <- mat$region
+mat <- as.matrix(mat[,-1])
+fisher.test(mat)
+```
+
+## Multi-breakpoint event summary and assembly
+
+```{r, include=FALSE}
+### -------------------------------------------------------------------------------
+### MULTI-BREAKPOINT INTEGRATION
+### -------------------------------------------------------------------------------
+
+# prepare the dataframe to include teh multi-breakpoint events
+catM <- catC[catC$integration_type %in% c("multi-breakpoint_integration", "complex_ecDNA_integration"),]
+catM <- separate(catM, col = bp_pair, into = c("bp1", "bp2"), sep = "_", remove = F)
+catM <- separate(catM, col = bp1, into = c("bp1_chr", "bp1_pos"), sep = ":", remove = T)
+catM <- separate(catM, col = bp2, into = c("bp2_chr", "bp2_pos"), sep = ":", remove = T)
+catM$event.id <- paste0(catM$sample, "/", catM$event)
+
+plot_bp_connections <- function(event_id){
+    # For each event, find the unique breakpoints, and find the unique chromosomes, and then plot them out 
+    event <- catM[catM$event.id == event_id,]
+    chrs <- unique(c(event$bp1_chr, event$bp2_chr))
+    sites <- unique(c(paste0(event$bp1_chr,":",event$bp1_pos), paste0(event$bp2_chr,":",event$bp2_pos)))
+    sitesDF <- data.frame(sites = sites, chr = gsub("\\:.*", "", sites))
+    
+    # dataframes to be filled
+    intSites <- data.frame(chr = gsub("\\:.*", "", sites), site = as.numeric(gsub(".*:", "", sites)), position = NA)
+    chrSize <- data.frame(chr = chrs, start = 0, size = NA, intStart = NA, intEnd = NA)
+    connect <- event[,c("bp1_chr", "bp1_pos", "bp2_chr", "bp2_pos", "category")]
+    connect$bp1_position <- NA
+    connect$bp2_position <- NA
+    
+    for (c in chrs) {
+        subsite <- sitesDF$sites[sitesDF$chr == c]
+        
+        # find the minimum position on the chromosome 
+        positions <- as.numeric(gsub(paste0(c,":"), "", subsite))
+        minsite <- min(positions)
+        maxsite <- max(positions)
+        
+        # add the length to the chrsize
+        len <- maxsite - minsite
+        chrSize$intStart[chrSize$chr == c] <- minsite
+        chrSize$intEnd[chrSize$chr == c] <- maxsite
+        chrSize$size[chrSize$chr == c] <- len/1000
+        
+        # subtract that value from the positions on that chromosome to zero them
+        intSites$position[intSites$chr == c] <- (intSites$site[intSites$chr == c] - minsite)/1000
+        
+        # adjust the positions on the connections
+        connect$bp1_position[connect$bp1_chr == c] <- (as.numeric(connect$bp1_pos[connect$bp1_chr == c]) - minsite)/1000
+        connect$bp2_position[connect$bp2_chr == c] <- (as.numeric(connect$bp2_pos[connect$bp2_chr == c]) - minsite)/1000
+    }
+    
+    # count how many connections for each int site
+    count <- table(c(connect$bp1_pos, connect$bp2_pos))
+    intSites$nConnect <- count[match(intSites$site, names(count))]
+    intSites$connect <- ifelse(intSites$nConnect == 1, "one", ifelse(intSites$nConnect == 2, "two", "three_plus"))
+    
+    # seperate heterologous integrants
+    connectA <- connect[connect$category != "heterologous",]
+    connectB <- connect[connect$category == "heterologous",]
+    
+    # make plot
+    p <- ggplot() +
+        # chromosome bars
+        geom_segment(data = chrSize, aes(y = chr, yend = chr, x = start, xend = size), 
+                     lineend = "round", color = "lightgrey", size = 3) + 
+        geom_point(data = intSites, aes(y = chr, x = position, colour = connect), 
+                   size = 3) +
+        geom_curve(data = connectA, aes(x = bp1_position, xend = bp2_position, y = bp1_chr, yend = bp2_chr), linetype = 2, size = 0.5, curvature = -0.3, colour = "#fdb714") +
+        geom_curve(data = connectB, aes(x = bp1_position, xend = bp2_position, y = bp1_chr, yend = bp2_chr), linetype = 2, size = 0.5, curvature = 0.4, colour = "#219EBC") +
+        scale_colour_manual(values = c("black","#BE1E2D", "#ec8992")) +
+        theme_bw() +
+        labs(x = "position in event (kb)") +
+        theme(panel.grid.minor = element_blank(),
+              panel.grid.major.y = element_blank(),
+              axis.line = element_blank(),
+              panel.border = element_blank(),
+              axis.ticks = element_blank(),
+              axis.text.y = element_blank(),
+              axis.text.x = element_text(size = 10, colour = "black"),
+              axis.title.x = element_text(size = 12, colour = "black", face = "bold"),
+              axis.title.y = element_blank(), legend.position = "none")
+    
+    p
+    
+    #dir.create(paste0("figure4/",event))
+    
+    ggsave(plot = p, filename = paste0("figure4/",event_id,"/plot_connections.pdf"), width = 5, height = 3, create.dir = T)
+}
+```
+
+#### Plot the connections
+
+```{r}
+plot_bp_connections(event_id = "HTMCP-03-06-02238/event2")
+plot_bp_connections(event_id = "HTMCP-03-06-02175/event2")
+plot_bp_connections(event_id = "HTMCP-03-06-02058/event1")
+plot_bp_connections(event_id = "HTMCP-03-06-02267/event1")
+plot_bp_connections(event_id = "HTMCP-03-06-02210/event1")
+plot_bp_connections(event_id = "HTMCP-03-06-02128/event2")    
+plot_bp_connections(event_id = "HTMCP-03-06-02149/event1")   
+plot_bp_connections(event_id = "HTMCP-03-06-02428/event1")  
+```
+
+## Multi-breakpoint events
+
+```{r, include=FALSE}
+meta <- htmcpMetaSave
+intOnly$event.id <- paste0(intOnly$sample, '/', intOnly$event)
+
+htmcp_path <- "/projects/hpv_nanopore_prj/htmcp/call_integration/output"
+
+### HPV METHYLATION
+
+# Find files with HPV methylation by read
+Files <- grep("SVsubset.bedpe", list.files(htmcp_path, recursive = TRUE, full.names = TRUE), value = TRUE)
+
+# Extract library names from file paths
+event <- gsub(paste0(htmcp_path, "/|/events|_SVsubset.bedpe"), "", Files)
+
+# Import data
+bedpe <- lapply(Files, read.delim, header = FALSE, sep = "\t")
+names(bedpe) <- event
+bedpe <- dplyr::bind_rows(bedpe, .id = "event.id")
+
+# annotated HPV breakpoints
+mb <- intOnly[intOnly$type == "multi-breakpoint_integration",]
+mb$HPV.clade <- meta$HPV.clade[match(mb$sample, meta$Patient)]
+
+## --------------------------------------------
+# SUMMARIZE THE NUMBER OF SV BREAKS IN A EVENT
+## --------------------------------------------
+
+svTypes <- bedpe %>% 
+    mutate(SV_pair = case_when(
+        grepl("chr",V1) & grepl("chr",V4) ~ "human",
+        grepl("HPV",V1) & grepl("chr",V4) | grepl("chr",V1) & grepl("HPV",V4) ~ "human_HPV",
+        grepl("HPV",V1) & grepl("HPV",V4) ~ "HPV"
+    )
+)
+
+svTypes$integration_type <- intOnly$type[match(svTypes$event.id, intOnly$event.id)]
+svTypes$HPV.type <- intOnly$HPV.type[match(svTypes$event.id, intOnly$event.id)]
+svTypes$sample <- intOnly$sample[match(svTypes$event.id, intOnly$event.id)]
+svTypes$HPV.clade <- meta$HPV.clade[match(svTypes$sample, meta$Patient)]
+svTypes$is.event.transcribed <- intOnly$is.event.transcribed[match(svTypes$event.id, intOnly$event.id)]
+
+# remove the HPV related SVs and replace with the breakpoint calls
+nbreaksHuman <- svTypes %>% dplyr::filter(SV_pair == "human" & integration_type == "multi-breakpoint_integration") %>%
+  dplyr::group_by(event.id, SV_pair) %>%
+  dplyr::summarise(n_breaks = n())
+
+# add the breakpoint calls
+nBreaksHPV <- data.frame(event.id = mb$event.id, SV_pair = "human_HPV", n_breaks = mb$nsites)
+nbreaks <- rbind(nbreaksHuman, nBreaksHPV)
+
+nbreaksAll <- nbreaks %>%
+  dplyr::group_by(event.id) %>%
+  dplyr::summarise(n_breaks = sum(n_breaks))
+
+order <- nbreaksAll$event.id[order(nbreaksAll$n_breaks, decreasing = T)]
+
+nbreaks$event.id <- factor(nbreaks$event.id, levels = order)
+
+nbreaksAnno <- gather(mb, variable, value, c("HPV.type", "HPV.clade", "sample", "is.event.transcribed"), factor_key=TRUE) 
+nbreaksAnno$event.id <- factor(nbreaksAnno$event.id, order)
+nbreaksAnno$variable <- factor(nbreaksAnno$variable, levels = c("is.event.transcribed","HPV.clade", "HPV.type", "sample"))
+
+nbreaks$HPV.type <- intOnly$HPV.type[match(as.character(nbreaks$event.id), intOnly$event.id)]
+nbreaks$is.event.transcribed <- intOnly$is.event.transcribed[match(as.character(nbreaks$event.id), intOnly$event.id)]
+```
+
+#### figures
+
+```{r}
+ann_colors <- list(HPV.clade = c(A7="#B55F8F", A9="#253083", Other="#A9A9A9"),
+                   HPV.type = c(HPV16="#3953A4", HPV18="#9768ad", HPV45="#CC138C", HPV82="#369797",
+                                HPV52="#0B8DCD", HPV31="#d2ecf9", HPV73="#737474", HPV68="#f3b2d4", HPV97="black", HPV58="#8bafba", HPV59="#ae3030"),
+                   is.event.transcribed = c(yes = "#f6851f", no = "#8e9aae"))
+p1 <- nbreaks %>% 
+    filter(SV_pair == "human_HPV") %>%
+    ggplot(aes(x = is.event.transcribed, y = n_breaks, colour = is.event.transcribed)) +
+    geom_boxplot(outlier.shape = NA) + 
+    geom_jitter(height = 0, width = 0.2, size =3, alpha=0.5) +
+    theme_minimal() +
+    xlab("HPV transcription status") + 
+    ylab("# of HPV breakpoint in event") +
+    scale_colour_manual(values = c(ann_colors[["is.event.transcribed"]])) +
+    theme(panel.grid = element_blank(), 
+          axis.text = element_text(size = 12,colour = "black"),
+          axis.title = element_text(size=12, face = "bold", colour = "black"), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line(), 
+          legend.position = "none") +
+    stat_compare_means(method = "wilcox")
+ggsave(p1, filename = "figure4/nbreaks_transcription.pdf", height = 2.7, width = 2.7, units = "in")
+p1
+
+mean(nbreaks$n_breaks[nbreaks$is.event.transcribed == "yes" & nbreaks$SV_pair == "human_HPV"])
+mean(nbreaks$n_breaks[nbreaks$is.event.transcribed == "no" & nbreaks$SV_pair == "human_HPV"])
+```
+
+```{r}
+# find unique colours for the samples
+n <- length(unique(nbreaksAnno$value[nbreaksAnno$variable == "sample"]))
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+col = sample(col_vector, n)
+names(col) <- unique(mb$sample)
+
+# order the anno data
+nbreaksAnno$event.id <- factor(nbreaksAnno$event.id, levels = levels(nbreaks$event.id))
+nbreaksAnno <- nbreaksAnno %>% arrange(event.id)
+    
+meta_colours <- list(values = c(A7="#B55F8F", A9="#253083", Other="#A9A9A9",
+                                HPV16="#3953A4", HPV18="#9768ad", HPV45="#CC138C", HPV82="#323636", HPV33="#2ba8be", 
+                                HPV52="#0B8DCD", HPV31="#d2ecf9", HPV73="#737474", HPV68="#f3b2d4", HPV97="black", HPV58="#8bafba", HPV59="#ae3030", yes="#f6851f", no="#8e9aae", col))
+
+# sample information
+p1 <- ggplot(nbreaksAnno, aes(y = variable, x = event.id, fill = value)) +
+    geom_tile(colour = "black") + 
+    theme_minimal()+
+    scale_fill_manual(values = meta_colours[["values"]]) +
+    theme(axis.text.x = element_blank(),
+          axis.title = element_blank(),
+          axis.text.y = element_text(size = 12, colour = "black"),
+          legend.text = element_text(size = 12, colour = "black"),
+          legend.title = element_blank(),
+          axis.ticks = element_blank(),
+          panel.grid.major.x = element_blank(),
+          legend.position = "none",
+          legend.key.size = unit(0.4, "cm"))
+
+p2 <- ggplot(nbreaks, aes(y = n_breaks, x = event.id, fill = SV_pair)) +
+    geom_bar(stat = "identity") +
+    theme_minimal() +
+    labs(y = "# of breakpoints in the event", x = NULL) +
+    scale_fill_manual(values = c("#457b9d","#e63946")) +
+    theme(axis.line.x.bottom = element_line(),
+          axis.line.y.left = element_line(),
+          axis.ticks.y = element_line(),
+          panel.grid.major.x = element_blank(),
+          panel.grid.minor.x = element_blank(),
+          axis.text.y = element_text(size = 12, colour = "black"),
+          axis.title = element_text(size = 14, colour = "black"),
+          axis.text.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          legend.position = "none")
+
+plot <- plot_grid(p2, p1, rel_heights = c(3,1), ncol = 1, align = "v", axis = "l")
+ggsave(plot, filename = "figure4/numSVBreakpointsEvent.pdf", height = 4, width = 7, units = "in")
+plot
+```
+
+```{r}
+## --------------------------------------------
+# CORRELATION PLOT
+## --------------------------------------------
+
+nbreaks2 <- spread(nbreaks, SV_pair, n_breaks)
+nbreaks2$human[is.na(nbreaks2$human)] <- 0
+
+plot2 <- ggscatter(nbreaks2, x = "human_HPV", y = "human",
+                    add = "reg.line",  # Add regressin line
+                    add.params = list(color = "#457b9d", fill = "lightgray"), # Customize reg. line
+                    conf.int = TRUE, alpha = 0.5) + stat_cor(method = "spearman") +
+    labs(x = "# of HPV-human breakpoints", y = "# of human SV breakpoints")
+ggsave(plot2, filename = "figure4/hpvSVCorrelation.pdf", height = 3.3, width = 3.3, units = "in")
+
+# save table
+write.table(nbreaks2,"tables/multi-breakpoint_svbreaks.txt", sep = "\t", col.names = T, row.names = F, quote = F)
+
+plot2
+```
+
+
+## HPV Adjacent Methylation
+
+#### Clean up the dataframe for figures
+
+```{r, include=FALSE}
+### ----------------------------------------------------------
+### READ IN DATAFRAMES
+### ----------------------------------------------------------
+
+# Event locations
+events <- sum
+events$id <- paste0(events$sample, "/", events$event)
+events <- events[events$event != "none",]
+
+# Event categories 
+summary <- intOnly
+summary$id <- paste0(summary$sample, "/", summary$event)
+```
+
+```{r, include=FALSE}
+### ----------------------------------------------------------
+### HPV GENE POSITION INFO
+### ----------------------------------------------------------
+
+# HPV Gene Info
+hpvAll <- read.delim("/projects/vporter_prj/ref/hpv_gff/HPV_all.gff", header = F)
+hpv <- hpvAll[hpvAll$V3 == "gene",]
+hpvLengths <- hpvAll[hpvAll$V4 == 1 & hpvAll$V3 == "region",]
+hpv_info <- strsplit(hpv$V9, ";")
+hpv_info <- lapply(hpv_info, function(x){
+  x <- x[grep("Name=", x)]
+  x <- gsub("Name=", "", x)
+  return(x)
+})
+hpv$gene <- unlist(hpv_info)
+hpv <- hpv[,-c(2,3,6,7,8,9)]
+colnames(hpv) <- c("genome", "start", "end","gene")
+hpv$gene <- gsub("ORF putative ", "", hpv$gene)
+
+# Add Reading Frame
+hpv$reading.frame <- ifelse(hpv$gene %in% c("E7","E1","E5","L2"), 1,
+                            ifelse(hpv$gene %in% c("E6","E2","L1"), 2, 3))
+hpv$position <- hpv$start + (hpv$end - hpv$start)/2
+
+## Create HPV Position Plots
+plot1 <- lapply(c("HPV16", "HPV18", "HPV45"), function(i) {
+  ggplot(hpv %>% filter(genome == i), aes(xmin = start, xmax = end, ymin = reading.frame - 0.4, ymax = reading.frame + 0.4)) + 
+    geom_rect(aes(fill = gene), colour = "black") +
+    scale_fill_lancet() +
+    geom_text(mapping = aes(x = position, y = reading.frame, label = gene), size = 3, fontface = "bold")+
+    scale_x_continuous(breaks = c(seq(0,8000,by=1000)), limits = c(0,8000)) +
+    theme(axis.line.y=element_blank(),
+          axis.text.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.title=element_blank(),
+          panel.background=element_blank(),
+          panel.border=element_blank(),
+          panel.grid.major=element_blank(),
+          panel.grid.minor=element_blank(),
+          plot.background=element_blank(),
+          axis.line.x = element_line(size = 0.5),
+          axis.text.x = element_text(size = 12, colour = "black"),
+          legend.position = "none")
+})
+```
+
+
+```{r, include=FALSE}
+### ----------------------------------------------------------
+### INTEGRATION EVENT METHYLATION DATA
+### ----------------------------------------------------------
+
+# Set file paths
+htmcp_path <- "/projects/hpv_nanopore_prj/htmcp/call_integration/output"
+
+# Find event methylation files
+eventMethFiles <- grep("event_methyl_freq.tsv", list.files(htmcp_path, recursive = TRUE, full.names = TRUE), value = TRUE)
+
+# Extract sample names from file paths
+ontLib <- gsub(paste0(htmcp_path, "/|/methylation/event_methyl_freq.tsv"), "", eventMethFiles)
+
+# Import ont sites
+eventMeth <- lapply(eventMethFiles, read.delim, header = TRUE, sep = "\t")
+names(eventMeth) <- ontLib
+eventMeth <- dplyr::bind_rows(eventMeth, .id = "sample")
+
+# Subset HPV data
+eventMethHPV <- eventMeth[grep("HPV", eventMeth$chromosome),]
+
+# Find and remap HPV genes
+eventMethHPV$hpv.gene <- NA 
+eventMethHPV$E6.start <- NA
+for (i in 1:nrow(eventMethHPV)) {
+  gene <- hpv$gene[hpv$start < eventMethHPV$start[i] & hpv$end > eventMethHPV$start[i] & hpv$genome == eventMethHPV$chromosome[i]]
+  
+  eventMethHPV$hpv.gene[i] <- ifelse(length(gene) > 0, paste(gene, collapse = ","),
+                                     ifelse(eventMethHPV$start[i] < hpv$start[hpv$genome == eventMethHPV$chromosome[i] & hpv$gene == "E6"] | eventMethHPV$start[i] > hpv$end[hpv$genome == eventMethHPV$chromosome[i] & hpv$gene == "L1"],
+                                            "LCR", NA))
+  
+  eventMethHPV$E6.start[i] <- ifelse(eventMethHPV$start[i] < hpv$end[hpv$genome == eventMethHPV$chromosome[i] & hpv$gene == "L1"], 
+                                     eventMethHPV$start[i] - hpv$start[hpv$genome == eventMethHPV$chromosome[i] & hpv$gene == "E6"],
+                                     -(hpv$start[hpv$genome == eventMethHPV$chromosome[i] & hpv$gene == "E6"] + 
+                                         (hpvLengths$V5[hpvLengths$V1 == eventMethHPV$chromosome[i]] - eventMethHPV$start[i])))
+}
+
+# Reorder factor levels
+eventMethHPV$chromosome <- factor(eventMethHPV$chromosome, levels = c("HPV16", "HPV18", "HPV45", "HPV82", "HPV52", "HPV58", "HPV33", "HPV31","HPV68", "HPV73","HPV35"))
+```
+
+
+```{r, include=FALSE}
+# unintegrated samples
+unint_samples <- sum$sample[sum$event == "none"]
+unint_samples <- c(unint_samples, "HTMCP-03-06-02205")
+
+# Find event methylation files
+hpvFiles <- grep("hpv_methylation_frequency.tsv", list.files(htmcp_path, recursive = TRUE, full.names = TRUE), value = TRUE)
+
+# Extract library names from file paths
+hpvMethNames <- gsub(paste0(htmcp_path, "/|/methylation/hpv_methylation_frequency.tsv"), "", hpvFiles)
+
+# Import
+hpvMeth <- lapply(hpvFiles, read.delim, header = FALSE, sep = "\t")
+hpvMeth <- lapply(hpvMeth, function(df) df[, c(1:3,5:8)])
+names(hpvMeth) <- hpvMethNames
+hpvMeth <- dplyr::bind_rows(hpvMeth, .id = "sample")
+hpvMeth <- hpvMeth[hpvMeth$sample %in% unint_samples,]
+colnames(hpvMeth) <- c("sample","chromosome","start","methylated","unmethylated","total.calls","perc.methylated")
+hpvMeth$integration.type <- "no_integration_detected"
+hpvMeth$id <- hpvMeth$sample
+hpvMeth$event <- "event0"
+
+# Find and remap HPV genes
+hpvMeth$hpv.gene <- NA 
+hpvMeth$E6.start <- NA
+for (i in 1:nrow(hpvMeth)) {
+  gene <- hpv$gene[hpv$start < hpvMeth$start[i] & hpv$end > hpvMeth$start[i] & hpv$genome == hpvMeth$chromosome[i]]
+  
+  hpvMeth$hpv.gene[i] <- ifelse(length(gene) > 0, paste(gene, collapse = ","),
+                                     ifelse(hpvMeth$start[i] < hpv$start[hpv$genome == hpvMeth$chromosome[i] & hpv$gene == "E6"] | hpvMeth$start[i] > hpv$end[hpv$genome == hpvMeth$chromosome[i] & hpv$gene == "L1"],
+                                            "LCR", NA))
+  
+  hpvMeth$E6.start[i] <- ifelse(hpvMeth$start[i] < hpv$end[hpv$genome == hpvMeth$chromosome[i] & hpv$gene == "L1"], 
+                                hpvMeth$start[i] - hpv$start[hpv$genome == hpvMeth$chromosome[i] & hpv$gene == "E6"],
+                                     -(hpv$start[hpv$genome == hpvMeth$chromosome[i] & hpv$gene == "E6"] + 
+                                         (hpvLengths$V5[hpvLengths$V1 == hpvMeth$chromosome[i]] - hpvMeth$start[i])))
+}
+```
+
+
+```{r, include=FALSE}
+### ----------------------------------------------------------
+### GET THE METHYLATION DATA ADJACENT TO HPV INTEGRATION
+### ----------------------------------------------------------
+
+# Get a list of files containing "methylregions.bed"
+files <- grep("methylregions.bed", list.files("/projects/hpv_nanopore_prj/htmcp/call_integration", recursive = TRUE, full.names = TRUE), value = TRUE)
+
+# Extract sample names from file paths
+names1 <- gsub("/projects/hpv_nanopore_prj/htmcp/call_integration/output/|methylation/regions/|/methylregions.bed", "", files)
+
+# Read data from files into a list
+mrList <- lapply(files, read.delim, header = FALSE)
+names(mrList) <- names1
+
+# Combine all data into one data frame and add an "id" column
+mr <- dplyr::bind_rows(mrList, .id = "id")
+
+# Add event categories and other information to the methyl regions data frame
+mr$integration.type <- summary$type[match(mr$id, summary$id)]
+mr$hpv.type <- summary$HPV.type[match(mr$id, summary$id)]
+
+# Subset event locations data frame to only the events in the methyl regions data frame
+eventsSub <- events[events$id %in% mr$id,]
+
+# Add 5' and 3' positions to the event locations data frame
+pos <- events %>%
+  dplyr::filter(event != "none") %>%
+  dplyr::group_by(id) %>%
+  dplyr::summarise(up_pos = min(pos),
+            down_pos = max(pos))
+
+for (i in 1:nrow(pos)){
+  pos$HPVdir[i] <- ifelse(events$HPVpos[events$pos == pos$up_pos[i]] > events$HPVpos[events$pos == pos$down_pos[i]], "forward", "reverse") 
+}
+pos$HPVdir[pos$id == "HTMCP-03-06-02185/event1"] <- "reverse"
+pos$HPVdir[pos$id == "HTMCP-03-06-02179/event3"] <- "reverse"
+
+# Add 5' and 3' positions and HPV direction to the methyl regions data frame
+mr$up_hpv_pos <- pos$up_pos[match(mr$id, pos$id)]
+mr$down_hpv_pos <- pos$down_pos[match(mr$id, pos$id)]
+mr$HPVdir <- pos$HPVdir[match(mr$id, pos$id)]
+
+# Add HPV distance to the methyl regions data frame
+mr$hpv.dist <- ifelse(grepl("5", mr$V12), mr$V2 - mr$up_hpv_pos, mr$V2 - mr$down_hpv_pos)
+
+#################
+
+# switch the direction to match the translation direction
+mrTln <- mr
+mrTln$hpv.dist <- case_when(
+  mr$HPVdir == "forward" & mr$V12 ==  "5_upstream" ~ -(abs(mr$hpv.dist)),
+  mr$HPVdir == "reverse" & mr$V12 ==  "5_upstream" ~ abs(mr$hpv.dist),
+  mr$HPVdir == "forward" & mr$V12 ==  "3_downstream" ~ abs(mr$hpv.dist),
+  mr$HPVdir == "reverse" & mr$V12 ==  "3_downstream" ~ -(abs(mr$hpv.dist)),
+  mr$HPVdir == "forward" & mr$V12 ==  "5_downstream" ~ -(abs(mr$hpv.dist)),
+  mr$HPVdir == "reverse" & mr$V12 ==  "5_downstream" ~ abs(mr$hpv.dist),
+  mr$HPVdir == "forward" & mr$V12 ==  "3_upstream" ~ abs(mr$hpv.dist),
+  mr$HPVdir == "reverse" & mr$V12 ==  "3_upstream" ~ -(abs(mr$hpv.dist)),
+  TRUE ~ mr$hpv.dist
+)
+
+## bin the methylation into 500 bp bins
+mrTln$bins <- smart_cut(mrTln$hpv.dist,
+                        seq(from = -5000, to = 5000, by = 500), 
+                        labels = ~paste0(.y[1],':',.y[2]-1), 
+                        simplify = FALSE)
+
+allbins <- smart_cut(seq(from = -5000, to = 5000, by = 500),
+                     seq(from = -5000, to = 5000, by = 500), 
+                     labels = ~paste0(.y[1],':',.y[2]-1), 
+                     simplify = FALSE)
+
+# make an average value for each bin
+mrAve <- mrTln %>%
+  dplyr::group_by(id,bins,V12, integration.type, hpv.type) %>%
+  dplyr::summarise(average_methyl = mean(V8))
+
+mrAve$bins <- factor(mrAve$bins, levels = levels(allbins))
+
+```
+
+#### Plot methylation beside HPV
+
+```{r}
+### ----------------------------------------------------------
+### PLOT THE METHYLATION DATA ADJACENT TO HPV INTEGRATION
+### ----------------------------------------------------------
+
+mrAve$is.event.transcribed <- sum$is.event.transcribed[match(mrAve$id, paste0(sum$sample, "/", sum$event))]
+
+mrPlots <- lapply(c("del-like_integration","dup-like_integration"), function(t){
+  # Filter mrAve data for ecDNA and deletion integration types
+  mrAveSub <- mrAve %>% filter(integration.type == t)
+  
+  # Order and factor the id variable for ecDNA data
+  order <- mrAveSub %>% 
+    dplyr::filter(bins %in% allbins[11:13]) %>% 
+    dplyr::group_by(id, is.event.transcribed, hpv.type) %>%
+    dplyr::summarise(ave = mean(average_methyl)) %>%
+    dplyr::arrange(hpv.type, is.event.transcribed, ave) %>% 
+    dplyr::distinct(id)
+  mrAveSub$id <- factor(mrAveSub$id, levels = order$id)
+  
+  # Remove NA values for id variable
+  mrAveSub <- mrAveSub[!is.na(mrAveSub$id) & !is.na(mrAveSub$bins),]
+  
+  # Create a plot for data
+  plot <- ggplot(mrAveSub, aes(x = bins, y = id, fill = average_methyl)) +
+    geom_tile() +
+    scale_fill_distiller(palette = "RdBu") +
+    theme_bw() +
+    facet_grid(hpv.type ~ ., scales = "free", space = "free") +
+    labs(fill = "average Methylation", y = "events", x = "distance from HPV integration") +
+    theme(axis.text.x = element_text(angle = 60, hjust = 0.5, vjust = 0.5,size = 12, colour = "black"),
+          axis.title = element_text(size = 14, face = "bold", colour = "black"),
+          panel.grid.major.y = element_blank())
+  return(list(order,plot))
+}
+)
+
+mrPlots2 <- lapply(c("yes","no"), function(t){
+    # Filter mrAve data for ecDNA and deletion integration types
+    mrAveSub <- mrAve %>% filter(is.event.transcribed == t & grepl("HTMCP", id)) 
+    
+    # Order and factor the id variable for ecDNA data
+    order <- mrAveSub %>% 
+        dplyr::filter(bins %in% allbins[11:13]) %>% 
+        dplyr::group_by(id, integration.type) %>%
+        dplyr::summarise(ave = mean(average_methyl)) %>%
+        dplyr::arrange(integration.type, ave) %>% 
+        dplyr::distinct(id)
+    mrAveSub$id <- factor(mrAveSub$id, levels = order$id)
+    
+    # Remove NA values for id variable
+    mrAveSub <- mrAveSub[!is.na(mrAveSub$id) & !is.na(mrAveSub$bins),]
+    
+    # Create a plot for data
+    plot <- ggplot(mrAveSub, aes(x = bins, y = id, fill = average_methyl)) +
+        geom_tile() +
+        scale_fill_distiller(palette = "RdBu") +
+        theme_bw() +
+        facet_grid(integration.type ~ ., scales = "free", space = "free") +
+        labs(fill = "average Methylation", y = "events", x = "distance from HPV integration") +
+        theme(axis.text.x = element_text(angle = 60, hjust = 0.5, vjust = 0.5,size = 12, colour = "black"),
+              axis.title = element_text(size = 14, face = "bold", colour = "black"),
+              panel.grid.major.y = element_blank())
+    return(list(order,plot))
+}
+)
+mrPlots
+```
+
+#### Methylation across the HPV genome
+
+```{r}
+### ----------------------------------------------------------
+### PLOT METHYLATION ACROSS THE HPV GENOME
+### ----------------------------------------------------------
+
+# get the order for the ecDNA and deletion plots
+delOrder <- as.data.frame(mrPlots[[1]][1])[,1]
+dupOrder <- as.data.frame(mrPlots[[2]][1])[,1]
+
+# Add the event categories and other info to the methyl regions
+eventMethHPV$id <- paste0(eventMethHPV$sample, "/", eventMethHPV$event)
+eventMethHPV$integration.type <- summary$type[match(eventMethHPV$id, summary$id)]
+
+# match the unintegrated samples
+hpvMeth <- hpvMeth[,colnames(eventMethHPV)]
+
+# add to the table 
+eventMethHPV <- rbind(eventMethHPV,hpvMeth)
+
+# define the integration types
+types <- c("del-like_integration","dup-like_integration","translocation_integration","no_integration_detected")
+
+# plot the HPV methylation for each integration type
+hpvPlot <- lapply(types, function(type) {
+  if(type == "del-like_integration"){
+    eventMethHPV$id = factor(eventMethHPV$id,levels = delOrder)
+  } else if (type == "dup-like_integration") {
+    eventMethHPV$id = factor(eventMethHPV$id,levels = dupOrder)
+  }
+  
+  ggplot(eventMethHPV %>% dplyr::arrange(chromosome) %>% filter(integration.type == type & !is.na(id)), 
+         aes(x = E6.start, y = id, colour = perc.methylated)) +
+    geom_point(size = 2) +
+    facet_grid(chromosome ~ integration.type, scales = "free", space = "free") +
+    theme_bw() + 
+    geom_vline(xintercept = 0, linetype = 2, size = 1) +
+    scale_color_distiller(palette = "RdBu") + 
+    labs(x = "adjusted position", y = "sample", colour = "% methylated") +
+    theme(axis.text.x = element_text(colour = "black", size = 11),
+          #axis.text.y = element_blank(), 
+          axis.title = element_text(colour = "black", size = 12, face = "bold"),
+          legend.text = element_text(size = 10, colour = "black"),
+          legend.title = element_text(size = 12, colour = "black"),
+          panel.grid.minor = element_blank(), 
+          axis.ticks.y = element_blank(),
+          axis.line = element_line())
+})
+hpvPlot
+```
+
+
+```{r, include=FALSE}
+### ----------------------------------------------------------
+### SAVE THE PLOTS 
+### ----------------------------------------------------------
+
+# eccDNA integration
+ggsave(mrPlots[[1]][[2]], filename = "figure5/del_methylRegions.pdf", width = 6, height = 6, units = "in")
+ggsave(hpvPlot[[1]], filename = "figure5/del_HPVmethyl.pdf", width = 6, height = 6, units = "in")
+
+# deletion integration
+ggsave(mrPlots[[2]][[2]], filename = "figure5/dup_methylRegions.pdf", width = 6, height = 6, units = "in")
+ggsave(hpvPlot[[2]], filename = "figure5/dup_HPVmethyl.pdf", width = 6, height = 6, units = "in")
+
+# translocation integration
+ggsave(hpvPlot[[3]], filename = "figure5/translocation_HPVmethyl.pdf", width = 8, height = 3, units = "in")
+
+# unintegrated 
+ggsave(hpvPlot[[4]], filename = "figure5/unintegrated_HPVmethyl.pdf", width = 8, height = 3, units = "in")
+
+### ----------------------------------------------------------
+### SAVE THE TABLES 
+### ----------------------------------------------------------
+
+# methyl regions
+mrAveSave1 <- mrAve[mrAve$integration.type %in% c("del-like_integration"),]
+mrAveSave2 <- mrAve[mrAve$integration.type %in% c("dup-like_integration"),]
+
+delOrderDf <- data.frame(name=delOrder, order=1:length(delOrder))
+delOrderDf$is.transcribed <- events$is.event.transcribed[match(delOrderDf$name, paste0(events$sample, "/", events$event))]
+dupOrderDf <- data.frame(name=dupOrder, order=1:length(dupOrder))
+dupOrderDf$is.transcribed <- events$is.event.transcribed[match(dupOrderDf$name, paste0(events$sample, "/", events$event))]
+
+mrAveSave1$id.number <- delOrderDf$order[match(mrAveSave1$id, delOrderDf$name)]
+mrAveSave2$id.number <- dupOrderDf$order[match(mrAveSave2$id, dupOrderDf$name)]
+
+mrAveSave <- rbind(mrAveSave1,mrAveSave2)
+mrAveSave <- mrAveSave[complete.cases(mrAveSave),]
+
+write.table(mrAveSave, file = "tables/methylationAdjacentRegions.txt",
+            quote = F, col.names = T, row.names = F, sep = "\t")
+
+# methyl HPV
+eventMethHPVSave1 <- eventMethHPV[eventMethHPV$integration.type %in% c("del-like_integration"),]     
+eventMethHPVSave2 <- eventMethHPV[eventMethHPV$integration.type %in% c("dup-like_integration"),]
+eventMethHPVSave4 <- eventMethHPV %>% dplyr::arrange(chromosome) %>% filter(integration.type == "translocation_integration" & !is.na(id))
+eventMethHPVSave5 <- eventMethHPV %>% dplyr::arrange(chromosome) %>% filter(integration.type == "no_integration_detected" & !is.na(id))
+
+eventMethHPVSave <- rbind(eventMethHPVSave1, eventMethHPVSave2, eventMethHPVSave4,eventMethHPVSave5)
+
+write.table(eventMethHPVSave, 
+            file = "tables/methylationHPVRegions.txt",
+            quote = F, col.names = T, row.names = F, sep = "\t")
+```
+
+## Transcription and Local Methylation
+
+```{r, include=FALSE}
+### ----------------------------------------------------------
+### RPKM OF TRANSCRIPTION IN UNMETHYLATED/METHYLATED REGIONS
+### ----------------------------------------------------------
+
+readcount <- read.delim("/projects/hpv_nanopore_prj/htmcp/illumina_call_integration_rna/tables/allHTMCPupdownRegionsCoverage.txt", header = F)
+nmappedreads <- read.delim("/projects/hpv_nanopore_prj/htmcp/illumina_call_integration_rna/tables/nmappedreadsHTMCP.txt", header = F)
+#regions <- read.delim("/projects/hpv_nanopore_prj/htmcp/illumina_call_integration_rna/tables/allHTMCPupdownRegions.bed", header = F)
+samplenames <- read.delim("/projects/hpv_nanopore_prj/htmcp/illumina_call_integration_rna/tables/allHTMCPupdownRegionsBamSamples.txt", header = F)
+samplenames <- gsub("output/|/star/hpvRNAAligned.out.sorted.bam", "", samplenames$V1)
+nmappedreadsSample <- read.delim("/projects/hpv_nanopore_prj/htmcp/illumina_call_integration_rna/tables/nmappedreadsHTMCPSamples.txt", header = F)
+nmappedreadsSample <- gsub("output/|/star/nmappedreads.txt", "", nmappedreadsSample$V1)
+#readcount <- cbind(regions[,1:4], readcount[,4:ncol(readcount)])
+colnames(readcount) <- c("chr", "start", "stop", "region", samplenames)
+nmappedreads$sample <- samplenames
+
+# add the sample that the region came from
+readcount$id <- mr$id[match(paste0(readcount$chr, readcount$start), paste0(mr$V9, mr$V10))]
+readcount$HPVdir <- mr$HPVdir[match(paste0(readcount$chr, readcount$start), paste0(mr$V9, mr$V10))]
+readcount$integration.type <- mr$integration.type[match(paste0(readcount$chr, readcount$start), paste0(mr$V9, mr$V10))]
+readcount$hpv.type <- mr$hpv.type[match(paste0(readcount$chr, readcount$start), paste0(mr$V9, mr$V10))]
+readcount$sample <- gsub("/.*", "", readcount$id)
+#readcount <- readcount[complete.cases(readcount),]
+
+# determine the upstream/downstream direction relative to HPV
+readcount$position <- case_when(
+  readcount$HPVdir == "forward" & readcount$region ==  "5_upstream" ~ "upstream",
+  readcount$HPVdir == "reverse" & readcount$region ==  "5_upstream" ~ "downstream",
+  readcount$HPVdir == "forward" &readcount$region ==  "3_downstream" ~ "downstream",
+  readcount$HPVdir == "reverse" & readcount$region ==  "3_downstream" ~ "upstream",
+  readcount$HPVdir == "forward" & readcount$region ==  "5_downstream" ~ "upstream",
+  readcount$HPVdir == "reverse" & readcount$region ==  "5_downstream" ~ "downstream",
+  readcount$HPVdir == "forward" & readcount$region ==  "3_upstream" ~ "downstream",
+  readcount$HPVdir == "reverse" & readcount$region ==  "3_upstream" ~ "upstream",
+  TRUE ~ "upstream"
+)
+
+readcount <- readcount[complete.cases(readcount),]
+
+# Covert to RPKM
+rpkm <- readcount
+for (i in samplenames) {
+  nmapped <- nmappedreads$V1[nmappedreads$sample == i]/1000000
+  rpkm[,i] <- ((rpkm[,i])+1/nmapped)/5000
+}
+
+# take out the other unused samples
+subsamples <- samplenames[samplenames %in% htmcpMeta$Patient]
+rpkm_mat <- rpkm[,subsamples]
+
+# scale the rpkm values
+z_score <- as.data.frame(t((apply(rpkm_mat[,subsamples], 1, scale))))
+mean <- as.data.frame((apply(rpkm_mat[,subsamples], 1, mean)))
+median <- as.data.frame((apply(rpkm_mat[,subsamples], 1, median)))
+colnames(z_score) <- subsamples
+z_score <- cbind(rpkm[,c("chr","start","stop","region","id","HPVdir","integration.type","hpv.type","sample","position")],z_score)
+z_score$zscore <- NA
+z_score$rpkm <- NA
+for (i in 1:nrow(z_score)) {
+  s <- z_score$sample[i]
+  z <- z_score[i,s]
+  r <- rpkm[i,s]
+  z_score$zscore[i] <- z
+  z_score$rpkm[i] <- r
+}
+z_score <- z_score[,c("chr","start","stop","region","id","HPVdir","integration.type","hpv.type","sample","position","zscore","rpkm")]
+z_score$mean <- mean$`(apply(rpkm_mat[, subsamples], 1, mean))`
+z_score$median <- median$`(apply(rpkm_mat[, subsamples], 1, median))`
+z_score$foldchange <- z_score$rpkm / z_score$median
+tnscpt <- z_score
+
+# add methylation values 
+aveMethyl <- mrAve %>%
+  filter(bins %in% unique(as.character(mrAve$bins))[6:15]) %>%
+  group_by(id,V12) %>%
+  summarise(aveMethyl = mean(average_methyl))
+
+tnscpt$aveMethyl <- aveMethyl$aveMethyl[match(paste0(tnscpt$id, tnscpt$region), paste0(aveMethyl$id, aveMethyl$V12))]
+
+# events that have demethylated upstreams
+toosmall <- unique(tnscpt$id[tnscpt$region == "inside"])
+tnscpt <- tnscpt %>% filter(!id %in% toosmall)
+demethyl <- unique(tnscpt$id[tnscpt$aveMethyl < 0.25 & tnscpt$position == "downstream"])
+tnscpt$methyl_status <- ifelse(tnscpt$id %in% demethyl, "demethylated", "methylated")
+
+# indicate if the event is transcribed or not
+tnscpt$is.transcribed <- events$is.event.transcribed[match(tnscpt$id, paste0(events$sample, "/", events$event))]
+
+```
+
+#### Transcription/methylation plots
+
+```{r}
+give.n <- function(x){
+    return(c(y = median(x)*1.05, label = length(x))) 
+    # experiment with the multiplier to find the perfect position
+}
+
+kable(head(tnscpt))
+
+tplot1 <- ggplot(tnscpt %>% filter(position == "downstream"), aes(x = methyl_status, y = log2(foldchange), fill = methyl_status)) +
+    geom_boxplot(outlier.shape = NA) + 
+    geom_jitter(height = 0, width = 0.2, size =3, alpha=0.5) +
+    #facet_grid(~ integration.type) +
+    theme_minimal() +
+    scale_fill_manual(values = c("#2166AC","#B2182B"))+
+    xlab("methylation status") + 
+    ylab("log2(sample/median)") +
+    theme(panel.grid.minor = element_blank(), 
+          axis.text = element_text(size = 13, colour = "black"),
+          axis.title = element_text(size=14, face = "bold"), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line(), 
+          legend.position = "none") +
+  stat_compare_means(method = "wilcox.test")
+ggsave(tplot1, filename = "figure5/methylvsdemethylFC.pdf", width = 3, height = 3, units = "in")
+tplot1
+
+tplot2 <- ggplot(tnscpt %>% filter(position == "downstream"), aes(x = methyl_status, y = log10(rpkm), fill = methyl_status)) +
+    geom_boxplot(outlier.shape = NA) + 
+    geom_jitter(height = 0, width = 0.2, size =3, alpha=0.5) +
+    theme_minimal() +
+    scale_fill_manual(values = c("#2166AC","#B2182B"))+
+    xlab("methylation status") + 
+    ylab("log10(RPKM)") +
+    stat_summary(fun.data = give.n, geom = "text", fun.y = median, 
+                 position = position_dodge(width = 0.75)) +
+    theme(panel.grid.minor = element_blank(), 
+          axis.text = element_text(size = 13, colour = "black"),
+          axis.title = element_text(size=14, face = "bold"), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line(), 
+          legend.position = "none") +
+    stat_compare_means(method = "wilcox.test")
+ggsave(tplot2, filename = "figure5/methylvsdemethylRPKM.pdf", width = 3, height = 3, units = "in")
+tplot2
+
+tplot3 <- ggplot(tnscpt  %>% filter(position == "downstream"), aes(x = is.transcribed, y = log10(rpkm), fill = is.transcribed)) +
+    geom_boxplot(outlier.shape = NA) + 
+    geom_jitter(height = 0, width = 0.2, size =3, alpha=0.5) +
+    theme_minimal() +
+    scale_fill_manual(values = c("#8d99ae", "#fb8500"))+
+    xlab("HPV transcription status") + 
+    ylab("log10(RPKM)") +
+    stat_summary(fun.data = give.n, geom = "text", fun.y = median, 
+                 position = position_dodge(width = 0.75)) +
+    theme(panel.grid.minor = element_blank(), 
+          axis.text = element_text(size = 13, colour = "black"),
+          axis.title = element_text(size=14, face = "bold"), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line(), 
+          legend.position = "none") +
+    stat_compare_means(method = "wilcox.test")
+ggsave(tplot3, filename = "figure5/transcribedvsnotRPKM.pdf", width = 3, height = 3, units = "in")
+tplot3
+
+tplot4 <- ggplot(tnscpt  %>% filter(position == "downstream"), aes(x = is.transcribed, y = aveMethyl, fill = is.transcribed)) +
+    geom_boxplot(outlier.shape = NA) + 
+    geom_jitter(height = 0, width = 0.2, size =3, alpha=0.5) +
+    theme_minimal() +
+    scale_fill_manual(values = c("#8d99ae", "#fb8500"))+
+    xlab("HPV transcription status") + 
+    ylab("average methylation (<2500bp)") +
+    stat_summary(fun.data = give.n, geom = "text", fun.y = median, 
+                 position = position_dodge(width = 0.75)) +
+    theme(panel.grid.minor = element_blank(), 
+          axis.text = element_text(size = 13, colour = "black"),
+          axis.title = element_text(size=14, face = "bold"), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line(), 
+          legend.position = "none") +
+    stat_compare_means(method = "wilcox.test")
+ggsave(tplot4, filename = "figure5/transcribedvsnotMETHYL.pdf", width = 3, height = 3, units = "in")
+tplot4
+
+tplot5 <- ggplot(tnscpt %>% filter(position == "downstream"), aes(x = aveMethyl, y = log10(rpkm))) +
+    geom_point(size =3, alpha=0.5, aes(colour = is.transcribed)) + 
+    geom_smooth(method='lm') +
+    scale_colour_manual(values = c("#8d99ae", "#fb8500"))+
+    theme_bw() +
+    xlab("methylation status") + 
+    ylab("log10(RPKM)") +
+    theme(panel.grid.minor = element_blank(), 
+          axis.text = element_text(size = 13, colour = "black"),
+          axis.title = element_text(size=14, face = "bold"), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line(), 
+          legend.position = "none") +
+    stat_cor(method = "pearson", label.x=0.45)
+ggsave(tplot5, filename = "figure5/transcriptvsmethyl_corr.pdf", width = 3, height = 3, units = "in")
+tplot5
+
+tplot6 <- ggplot(tnscpt, aes(x = position, y = log10(rpkm), fill = position)) +
+    geom_boxplot(outlier.shape = NA) + 
+    geom_jitter(height = 0, width = 0.2, size =3, alpha=0.5) +
+    theme_minimal() +
+    facet_wrap(~ methyl_status)+
+    scale_fill_manual(values = c("#2166AC","#B2182B"))+
+    xlab("position relative to HPV transcription") + 
+    ylab("log10(RPKM)") +
+    stat_summary(fun.data = give.n, geom = "text", fun.y = median, 
+                 position = position_dodge(width = 0.75)) +
+    theme(panel.grid.minor = element_blank(), 
+          axis.text = element_text(size = 13, colour = "black"),
+          axis.title = element_text(size=14, face = "bold"), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line(), 
+          legend.position = "none") +
+    stat_compare_means(method = "wilcox.test")
+ggsave(tplot6, filename = "figure5/upvsdownRPKM.pdf", width = 5, height = 3, units = "in")
+tplot6
+
+ehpvH <- ehpv[paste0(ehpv$sample, "/", ehpv$event) %in% tnscpt$id,]
+
+distplot <- ggplot(ehpvH, aes(x=distance/1000, fill = is.max.site)) +
+    geom_histogram(bins = 50) +
+    facet_grid(is.max.site ~ ., scales = "free_y") +
+    theme_minimal() +
+    scale_fill_manual(values = c("#fb8500","#8d99ae"))+
+    xlab("distance from HPV (kb)") + 
+    ylab("number of RNA HPV/human junctions") +
+    theme(axis.text = element_text(size = 13, colour = "black"),
+          axis.title = element_text(size=14, face = "bold"), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line(), 
+          legend.position = "none") 
+ggsave(distplot, filename = "figure5/transcribedDistHist.pdf", width = 3, height = 3, units = "in")
+distplot
+```
+
+## Allelic methylation at HPV integration events
+
+```{r, include=FALSE}
+files1 <- grep("diff_meth.csv", list.files("/projects/hpv_nanopore_prj/htmcp/call_integration/output", 
+                                                  recursive = T, full.names = T),value = T)
+
+files2 <- grep("hpv_phaseblock_hp.txt", list.files("/projects/hpv_nanopore_prj/htmcp/call_integration/output", 
+                                             recursive = T, full.names = T),value = T)
+
+files3 <- grep("dmr_dist_hpv.bed", list.files("/projects/hpv_nanopore_prj/htmcp/call_integration/output", 
+                                                     recursive = T, full.names = T),value = T)
+
+# get the sample names
+names1 <- gsub("/projects/hpv_nanopore_prj/htmcp/call_integration/output/|/methylation/diff_meth.csv", "", files1)
+names2 <- gsub("/projects/hpv_nanopore_prj/htmcp/call_integration/output/|/event_phase/|/hpv_phaseblock_hp.txt", "", files2)
+names3 <- gsub("/projects/hpv_nanopore_prj/htmcp/call_integration/output/|/event_phase/|/dmr_dist_hpv.bed", "", files3)
+
+events <- strsplit(names2, "event")
+```
+
+```{r, include=FALSE}
+### MAKE THE FUNCTION
+generatePlotDF <- function(sample, event){
+  dmrPath <- grep(sample, files1, value = T)
+  pbPath <- grep(event, files2, value = T)
+  
+  # dmrs
+  dmr <- read.delim(dmrPath, header = T)
+  
+  # HPV phaseblock
+  hpv <- read.delim(pbPath, header = F)
+  
+  if(ncol(hpv) == 10){
+    colnames(hpv) <- c("hpvChr", "hpvStart", "hpvEnd", "hpvSites", "id", "pbChr", "pbStart", "pbEnd", "pbSize", "HP")
+    hpv$midpoint <- (hpv$hpvEnd+hpv$hpvStart)/2
+    hpv$hpvDistStart <- hpv$pbStart - hpv$midpoint
+    hpv$hpvDistEnd <- hpv$pbEnd - hpv$midpoint
+    
+    # convert to distance from HPV
+    dmrChr <- dmr %>% filter(chr == hpv$pbChr[1])
+    dmrChr$hpvDistStart <- dmrChr$start-hpv$midpoint[1]
+    dmrChr$hpvDistEnd <- dmrChr$end-hpv$midpoint[1]
+    
+    # subset dmrs to the phase block with HPV
+    dmrHPV <- dmr %>% filter(chr == hpv$pbChr[1], start > hpv$pbStart[1], end < hpv$pbEnd[1])
+    
+    # convert to distance from HPV
+    dmrHPV$hpvDistStart <- dmrHPV$start-hpv$midpoint[1]
+    dmrHPV$hpvDistEnd <- dmrHPV$end-hpv$midpoint[1]
+    
+    if (hpv$HP[1] == "HP1"){
+      colnames(dmrHPV)[6:7] <- c("hpv", "non.HPV")
+    } else{
+      colnames(dmrHPV)[6:7] <- c("non.HPV", "hpv")
+    }
+    
+    # plot the HPV haplotype vs the other haplotype
+    dmrHPV$diff.Methy.Dir <- ifelse(dmrHPV$hpv > dmrHPV$non.HPV, abs(dmrHPV$diff.Methy), -(abs(dmrHPV$diff.Methy)))
+    
+    # subset to 200kb on either side
+    dmrHPV <- dmrHPV[dmrHPV$hpvDistStart > -500000 & dmrHPV$hpvDistEnd < 500000,]
+    
+    # determine the missing regions of the phase blocks
+    if(hpv$hpvDistStart[1] > -500000){
+      up <- data.frame(start=-500000,end=hpv$hpvDistStart[1])
+    } else{
+      up <- NULL
+    }
+    
+    if(hpv$hpvDistEnd[1] < 500000){
+      down <- data.frame(start=hpv$hpvDistEnd[1],end=500000)
+    } else{
+      down <- NULL
+    }
+    
+    ## average methylation in DMRs
+    
+    h1 <- mean(dmrHPV$non.HPV)
+    h2 <- mean(dmrHPV$hpv)
+    meth <- ifelse(h1 < h2, abs(h2-h1), -abs((h1-h2)))
+    
+    return(list(dmrHPV, hpv, up, down, meth,dmrChr)) 
+  }
+  
+}
+```
+
+```{r, include=FALSE}
+### RUN THE FUNCTION
+allEvents <- lapply(events, function(x){
+  generatePlotDF(sample = x[1], event = x[2])
+})
+
+### NAME THE EVENTS
+lab <- lapply(events, function(x){
+  event <- paste0("event", x[2])
+  l <- paste0(x[1], ":", event)
+  return(l)
+})
+
+lab <- as.data.frame(t(rbind(lab)))
+names(allEvents) <- lab$lab
+```
+
+```{r, include=FALSE}
+### ----------------------------------------------------------
+### GET THE FILES FOR THE DMR DENSITY
+### ----------------------------------------------------------
+
+files3 <- grep("densityHPVBins.txt", list.files("/projects/hpv_nanopore_prj/htmcp/call_integration/output", 
+                                                  recursive = T, full.names = T),value = T)
+
+files4 <- grep("dmrHotspotIntersectHPV.bed", list.files("/projects/hpv_nanopore_prj/htmcp/call_integration/output", 
+                                                          recursive = T, full.names = T),value = T)
+
+files5 <- grep("densityDMRHotspotsRegions.sorted.bed", list.files("/projects/hpv_nanopore_prj/htmcp/call_integration/output", 
+                                                                    recursive = T, full.names = T),value = T)
+
+# get the sample names
+names1 <- gsub("/projects/hpv_nanopore_prj/htmcp/call_integration/output/|/methylation/densityHPVBins.txt", "", files3)
+names2 <- gsub("/projects/hpv_nanopore_prj/htmcp/call_integration/output/|/methylation/dmrHotspotIntersectHPV.bed", "", files4)
+
+dsHPV <- list()
+for (f in 1:length(files3)) {
+  file <- files3[f]
+  df <- read.delim(file, header = T)
+  dsHPV[[f]] <- df
+}
+names(dsHPV) <- names1
+dsHPV <- bind_rows(dsHPV, .id = "sample")
+dsHPV$region <- paste0(dsHPV$sample, ":", dsHPV$sites)
+
+intHPV <- list()
+for (f in 1:length(files4)) {
+  file <- files4[f]
+  df <- read.delim(file, header = F)
+  intHPV[[f]] <- df
+}
+names(intHPV) <- names2
+intHPV <- bind_rows(intHPV, .id = "sample")
+intHPV$region <- paste0(intHPV$sample, ":", intHPV$V4)
+intHPV <- intHPV[intHPV$V5 != ".",]
+intHPV$DMR.size <- intHPV$V7 - intHPV$V6
+
+### The size distribution of HPV hotspots
+summary(intHPV$DMR.size)
+intHPV$test <- "DMR_HPV"
+
+allDMR <- list()
+for (f in 1:length(files5)) {
+  file <- files5[f]
+  df <- read.delim(file, header = F)
+  allDMR[[f]] <- df
+}
+names(allDMR) <- names2
+allDMR <- bind_rows(allDMR, .id = "sample")
+allDMR$DMR.size <- allDMR$V3 - allDMR$V2 
+
+### The size distribution of all hotspots
+summary(allDMR$DMR.size)
+allDMR$test <- "all"
+dmrSizeDF <- rbind(allDMR, intHPV[,c(1:4,11,12)])
+
+```
+
+
+```{r, include=FALSE}
+dsHPVsub <- dsHPV[dsHPV$bin_type == "HPV",]
+dsHPVsub <- dsHPVsub %>% arrange(dsNorm)
+dsHPV$region <- factor(dsHPV$region, levels = dsHPVsub$region)
+
+myPalette <- colorRampPalette(brewer.pal(11, "Greys"))
+heat <- ggplot(dsHPV %>% filter(region %in% intHPV$region), aes(x = as.factor(bin_num), y = region, fill = dsNorm)) + 
+  geom_tile() +
+  scale_fill_gradientn(colours = myPalette(100), limits = c(0, 1)) +
+  geom_vline(xintercept = 301, colour = "red", linetype=2) +
+  theme(axis.text = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank())
+```
+
+#### DMR hotspot size
+
+```{r}
+pSize <- ggplot(dmrSizeDF, aes(y = DMR.size, x = test)) +
+  geom_violin() +
+  #geom_jitter(height = 0, width = 0.1, size =2, alpha=0.5) +
+  theme_bw() +
+  labs(y = "DMR hotspot size", x = NULL) +
+  theme(axis.text.y = element_text(size = 10, colour = "black"),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title = element_text(size = 12, colour = "black", face = "bold"))
+
+pSize <- ggplot(dmrSizeDF %>% filter(V1 != "chrX"), aes(x = DMR.size/1000000, colour = test)) +
+  geom_density(size = 1) +
+  theme_bw() +
+  scale_colour_manual(values = c("grey", "#ef233c")) +
+  labs(x = "DMR hotspot size (Mb)", colour = NULL) +
+  xlim(0,30)+
+  geom_vline(xintercept = median(dmrSizeDF$DMR.size[dmrSizeDF$test == "DMR_HPV"])/1000000, linetype = 2, colour = "#ef233c")+
+  geom_vline(xintercept = median(dmrSizeDF$DMR.size[dmrSizeDF$test == "all"])/1000000, linetype = 2, colour = "grey")+
+  theme(axis.text.x = element_text(size = 10, colour = "black"),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.grid.minor.y = element_blank(), panel.grid.major.y = element_blank(),
+        axis.title = element_text(size = 12, colour = "black", face = "bold")) 
+
+summary(dmrSizeDF$DMR.size[dmrSizeDF$V1 != "chrX" & dmrSizeDF$test == "all"])
+summary(dmrSizeDF$DMR.size[dmrSizeDF$V1 != "chrX" & dmrSizeDF$test == "DMR_HPV"])
+
+ggsave(plot = pSize, filename = "figure6/DMRHPVHotspotSize.pdf", width = 4, height = 5, units = "in")
+pSize
+```
+
+
+```{r, include=FALSE}
+types <- intOnly
+
+# get the total number of each event
+tot <- types %>%
+  group_by(type) %>%
+  summarise(n = n())
+
+# match the HPV DMRs with events
+intHPV$event <- sum$event[match(paste0(intHPV$sample,gsub("\\,.*","", intHPV$V4)), paste0(sum$sample,sum$HPV.site))]
+intHPV$integration_type <- types$type[match(paste0(intHPV$sample,intHPV$event), paste0(types$sample,types$event))]
+intHPV$total_type <- tot$n[match(intHPV$integration_type, tot$type)]
+intHPV$integration_type <- gsub("_integration", "", intHPV$integration_type)
+intHPV$HPV.type <- sum$HPVchr[match(intHPV$sample, sum$sample)]
+intHPV$is.event.transcribed <- sum$is.event.transcribed[match(paste0(intHPV$sample,intHPV$event), paste0(sum$sample,sum$event))]
+
+type_perc <- intHPV %>%
+  group_by(integration_type) %>%
+  summarise(perc=n()/unique(total_type))
+
+type_perc$integration_type <- factor(type_perc$integration_type, levels = type_perc$integration_type[order(type_perc$perc, decreasing = T)])
+type_perc
+
+# event types that effect methylation
+intHPV$integration_type <- ifelse(is.na(intHPV$integration_type), "unmatched", intHPV$integration_type)
+intHPV$integration_type <- factor(intHPV$integration_type, 
+                                  levels = names(summary(as.factor(intHPV$integration_type))[rev(order(summary(as.factor(intHPV$integration_type))))]))
+
+
+ptypes1 <- ggplot(intHPV, aes(x = integration_type)) +
+  geom_bar() +
+  theme_bw() + 
+  #ylim(0,13) +
+  labs(x = "integration type of HPV-overlapped DMR hotspots") +
+  theme(axis.title = element_text(size = 14, colour = "black", face = "bold"),
+        axis.text = element_text(size = 12, colour = "black"))
+ptypes2 <- ggplot(type_perc, aes(x = integration_type, y = perc)) +
+  geom_bar(stat = "identity") +
+  theme_bw() + 
+  labs(x = "integration type of HPV-overlapped DMR hotspots", y = "percent of events") +
+  theme(axis.title = element_text(size = 14, colour = "black", face = "bold"),
+        axis.text = element_text(size = 12, colour = "black"))
+ggsave(plot = ptypes2, filename = "figure6/DMRHPVHotspotTypesPerc.pdf", width = 4, height = 4, units = "in")
+ggsave(plot = ptypes1, filename = "figure6/DMRHPVHotspotTypes.pdf", width = 8, height = 6, units = "in")
+```
+
+```{r, include=FALSE}
+### ----------------------------------------------------------
+### SUBSET FOR THE SIGNIFICANT EVENTS
+### ----------------------------------------------------------
+
+intHPV$event.id <- paste0(intHPV$sample, ":", intHPV$event, "_", intHPV$V1, "_", intHPV$V2)
+subEvents <- allEvents[-grep(pattern = "chrX",names(allEvents))]
+
+sigEvents <- subEvents[names(subEvents) %in% intHPV$event.id]
+
+# find order
+methyl <- lapply(sigEvents, function(x){
+  methyl <- x[[5]]
+  methylDF <- data.frame(aveMethyl = methyl)
+  return(methylDF)
+})
+m <- bind_rows(methyl, .id = "id")
+m <- arrange(m, aveMethyl)
+
+sigEvents <- sigEvents[m$id]
+
+### ----------------------------------------------------------
+### ADD OTHER INFO
+### ----------------------------------------------------------
+
+m$status <- ifelse(m$aveMethyl > 0.25, "methylated", ifelse(m$aveMethyl < -0.25, "unmethylated", "variable"))
+m$int.type <- intHPV$integration_type[match(m$id, intHPV$event.id)]
+m$event <- intHPV$event[match(m$id, intHPV$event.id)]
+m$sample <- intHPV$sample[match(m$id, intHPV$event.id)]
+m$HPV.type <- intHPV$HPV.type[match(m$id, intHPV$event.id)]
+m$DMR.size <- intHPV$DMR.size[match(m$id, intHPV$event.id)]
+m$is.event.transcribed <- intHPV$is.event.transcribed[match(m$id, intHPV$event.id)]
+m$event.loci  <- paste0(m$sample, ":", m$event)
+m$nevents <- sumAll$events[match(m$sample, sumAll$sample)]
+```
+
+
+
+
+
+
+```{r, include=FALSE}
+### ----------------------------------------------------------
+### DMR P VALUES
+### ----------------------------------------------------------
+
+files7 <-grep("/pvalue.txt", list.files("/projects/hpv_nanopore_prj/htmcp/call_integration/output", 
+                                                   recursive = T, full.names = T),value = T)
+files7_1Mb <- grep("dmr_permute_1Mb", files7,value = T)
+files7_500kbup <- grep("dmr_permute_500kbup", files7,value = T)
+files7_500kbdown <- grep("dmr_permute_500kbdown", files7,value = T)
+files7_hotspot <- files7[!files7 %in% c(files7_1Mb,files7_500kbup, files7_500kbdown)]
+names_1Mb <- gsub("/projects/hpv_nanopore_prj/htmcp/call_integration/output/|/event_phase|/dmr_permute_1Mb/pvalue.txt", "", files7_1Mb)
+names_500kbup <- gsub("/projects/hpv_nanopore_prj/htmcp/call_integration/output/|/event_phase|/dmr_permute_500kbup/pvalue.txt", "", files7_500kbup)
+names_500kbdown <- gsub("/projects/hpv_nanopore_prj/htmcp/call_integration/output/|/event_phase|/dmr_permute_500kbdown/pvalue.txt", "", files7_500kbdown)
+names_hotspot <- gsub("/projects/hpv_nanopore_prj/htmcp/call_integration/output/|/event_phase|/dmr_permute/pvalue.txt", "", files7_hotspot)
+
+dmrP1 <- list()
+for (f in 1:length(files7_1Mb)) {
+  file <- files7_1Mb[f]
+  df <- read.delim(file, header = T)
+  dmrP1[[f]] <- df
+}
+names(dmrP1) <- names_1Mb
+dmrP1 <- bind_rows(dmrP1, .id = "id")
+dmrP1$region <- "region_1Mb"
+
+dmrP2 <- list()
+for (f in 1:length(files7_500kbup)) {
+    file <- files7_500kbup[f]
+    df <- read.delim(file, header = T)
+    dmrP2[[f]] <- df
+}
+names(dmrP2) <- names_500kbup
+dmrP2 <- bind_rows(dmrP2, .id = "id")
+dmrP2$region <- "region_500kb_up"
+
+dmrP3 <- list()
+for (f in 1:length(files7_500kbdown)) {
+    file <- files7_500kbdown[f]
+    df <- read.delim(file, header = T)
+    dmrP3[[f]] <- df
+}
+names(dmrP3) <- names_500kbdown
+dmrP3 <- bind_rows(dmrP3, .id = "id")
+dmrP3$region <- "region_500kb_down"
+
+dmrP4 <- list()
+for (f in 1:length(files7_hotspot)) {
+    file <- files7_hotspot[f]
+    df <- read.delim(file, header = T)
+    dmrP4[[f]] <- df
+}
+names(dmrP4) <- names_hotspot
+dmrP4 <- bind_rows(dmrP4, .id = "id")
+dmrP4$region <- "hotspot"
+
+# put the regions all together
+dmr_regions <- rbind(dmrP2, dmrP3)
+
+# adjusted p value
+dmr_regions <- dmr_regions %>%
+    group_by(id) %>%
+    mutate(pval_adjusted = p.adjust(pval, method = "BH")) %>%  # Benjamini-Hochberg adjustment
+    ungroup()
+
+# classify events as significant both directions or one sided significant
+sig_dir <- dmr_regions %>%
+    select(id, sample, event, region, pval_adjusted) %>%
+    pivot_wider(names_from = region, values_from = pval_adjusted) %>%
+    mutate(significant_region = case_when(
+        region_500kb_up < 0.05 & region_500kb_down < 0.05 ~ "both_directions",
+        region_500kb_up < 0.05 & region_500kb_down > 0.05 ~ "one_direction_up",
+        region_500kb_up > 0.05 & region_500kb_down < 0.05 ~ "one_direction_down",
+        region_500kb_up > 0.05 & region_500kb_down > 0.05 ~ "none"))
+
+sig_dir$id <- gsub("/", ":",sig_dir$id)
+sig_dir$event_name <- gsub("_.*", "", sig_dir$event)
+sig_dir$is.event.transcribed <- sum$is.event.transcribed[match(paste0(sig_dir$sample, sig_dir$event_name), paste0(sum$sample, sum$event))]
+
+# sig event IDs
+sig_event_ids <- sig_dir$id[sig_dir$significant_region != "none"]
+
+# add pvalue to table
+m$pval_up <- sig_dir$region_500kb_up[match(m$id,sig_dir$id)]
+m$pval_down <- sig_dir$region_500kb_down[match(m$id,sig_dir$id)]
+m$significant_region <- sig_dir$significant_region[match(m$id,sig_dir$id)]
+m$significant_region_simple <- ifelse(m$significant_region %in% c("one_direction_down","one_direction_up"), "one_direction", m$significant_region)
+m$significant_region_simple <- factor(m$significant_region_simple, levels = c("one_direction","none", "both_directions"))
+# add number 
+m$number <- 1:nrow(m)
+
+# rearrange number to match figure
+m <- m %>%
+    arrange(significant_region_simple, number)
+
+#give new number
+m$number <- as.character(1:nrow(m))
+
+```
+
+#### DMR heatmap
+
+```{r}
+## new code
+alldmrs <- lapply(sigEvents, function(x){
+  df <- x[[6]]
+  return(df)
+})
+dmrs <- bind_rows(alldmrs, .id = "event.id")
+
+dmrsFilt <- dmrs[abs(dmrs$hpvDistStart) < 10000000 & abs(dmrs$hpvDistEnd) < 10000000,]
+dmrsFilt$region <- intHPV$region[match(dmrsFilt$event.id, intHPV$event.id)]
+dmrsFilt <- dmrsFilt[dmrsFilt$event.id %in% m$id,]
+dmrsFilt$event.id <- factor(dmrsFilt$event.id, levels = m$id)
+intDF <- data.frame(event.id = unique(dmrsFilt$event.id), integer = as.integer(unique(dmrsFilt$event.id)))
+dmrsFilt$num <- intDF$integer[match(dmrsFilt$event.id, intDF$event.id)]
+
+pdmrs <- ggplot(dmrsFilt, aes(xmin = (hpvDistStart)/1000000, xmax = (hpvDistEnd)/1000000, ymin = num-1, ymax = num+1)) +
+  geom_rect(size=0.01, colour = "black") +
+  #geom_rect(aes(xmin = start, xmax = end, ymin = as.integer(as.factor(region))-1, ymax = as.integer(as.factor(region))+1, fill = "#ef233c")) +
+  facet_wrap(event.id ~ ., scales = "free_y", ncol = 1) +
+  theme_bw() +
+  labs(x = "distance from HPV integration (Mb)")+
+  geom_vline(xintercept = 0, linetype = 1, colour = "#ef233c", size = 0.5)+
+  xlim(-10,10)+
+  theme(strip.background = element_blank(),
+        strip.text = element_blank(),
+        axis.text.y = element_blank(),
+        axis.text.x = element_text(size = 12, colour = "black"),
+        axis.title.x = element_text(size = 14, colour = "black", face = "bold"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.ticks.y = element_blank())
+
+ggsave(plot = pdmrs, filename = "figure6/DMRsAroundHPV10Mb.pdf", width = 8, height = 10, units = "in")
+pdmrs
+```
+
+#### Direction of methylation
+
+```{r}
+### ----------------------------------------------------------
+### MAKE THE FIGURE SHOWING DMR METHYLATION AROUND HPV
+### ----------------------------------------------------------
+v1 <- names(sigEvents)
+v2 <- m$id
+order_indices <- match(v2, v1)
+sigEvents <- sigEvents[order_indices]
+all(names(sigEvents) == v2)
+
+p <- NULL
+for (i in 1:length(sigEvents)) {
+  sub <- sigEvents[[i]]
+  
+  if(is.null(sub[[3]]) & is.null(sub[[4]])){
+    plot <- ggplot() +
+      geom_rect(data=sub[[1]], aes(xmin = hpvDistStart/1000, xmax = hpvDistEnd/1000, ymin = 0, ymax = 1, fill = diff.Methy.Dir, colour = diff.Methy.Dir), size = 0.5) +
+      theme_bw() + 
+      xlim(c(-500,500))+
+      scale_fill_distiller(palette = "RdBu", limits = c(-1,1)) +
+      scale_colour_distiller(palette = "RdBu", limits = c(-1,1)) +
+      geom_vline(xintercept = 0, linetype = 2) +
+      theme(panel.grid.minor = element_blank(),
+            panel.grid.major = element_blank(),
+            axis.text = element_blank(),
+            axis.ticks = element_blank(),
+            legend.position = "none",
+            plot.margin = unit(c(0, 0, 0, 0), "cm"))
+  } else if(is.null(sub[[3]])){
+    plot <- ggplot() +
+      geom_rect(data=sub[[1]], aes(xmin = hpvDistStart/1000, xmax = hpvDistEnd/1000, ymin = 0, ymax = 1, fill = diff.Methy.Dir, colour = diff.Methy.Dir), size = 0.5) +
+      theme_bw() + 
+      geom_rect(data=sub[[4]], aes(xmin=(start/1000), xmax = (end/1000),ymin = 0, ymax = 1), fill = "grey")+
+      xlim(c(-500,500))+
+      scale_fill_distiller(palette = "RdBu", limits = c(-1,1)) +
+      scale_colour_distiller(palette = "RdBu", limits = c(-1,1)) +
+      geom_vline(xintercept = 0, linetype = 2) +
+      theme(panel.grid.minor = element_blank(),
+            panel.grid.major = element_blank(),
+            axis.text = element_blank(),
+            axis.ticks = element_blank(),
+            legend.position = "none",
+            plot.margin = unit(c(0, 0, 0, 0), "cm"))
+  } else if(is.null(sub[[4]])){
+    plot <- ggplot() +
+      geom_rect(data=sub[[1]], aes(xmin = hpvDistStart/1000, xmax = hpvDistEnd/1000, ymin = 0, ymax = 1, fill = diff.Methy.Dir, colour = diff.Methy.Dir), size = 0.5) +
+      theme_bw() + 
+      geom_rect(data=sub[[3]], aes(xmin=(start/1000), xmax = (end/1000),ymin = 0, ymax = 1), fill = "grey")+
+      xlim(c(-500,500))+
+      scale_fill_distiller(palette = "RdBu", limits = c(-1,1)) +
+      scale_colour_distiller(palette = "RdBu", limits = c(-1,1)) +
+      geom_vline(xintercept = 0, linetype = 2) +
+      theme(panel.grid.minor = element_blank(),
+            panel.grid.major = element_blank(),
+            axis.text = element_blank(),
+            axis.ticks = element_blank(),
+            legend.position = "none",
+            plot.margin = unit(c(0, 0, 0, 0), "cm"))
+  } else{
+    plot <- ggplot() +
+      geom_rect(data=sub[[1]], aes(xmin = hpvDistStart/1000, xmax = hpvDistEnd/1000, ymin = 0, ymax = 1, fill = diff.Methy.Dir, colour = diff.Methy.Dir), size = 0.5) +
+      theme_bw() + 
+      geom_rect(data=sub[[3]], aes(xmin=(start/1000), xmax = (end/1000),ymin = 0, ymax = 1), fill = "grey")+
+      geom_rect(data=sub[[4]], aes(xmin=(start/1000), xmax = (end/1000),ymin = 0, ymax = 1), fill = "grey")+
+      xlim(c(-500,500))+
+      scale_fill_distiller(palette = "RdBu", limits = c(-1,1)) +
+      scale_colour_distiller(palette = "RdBu", limits = c(-1,1)) +
+      geom_vline(xintercept = 0, linetype = 2) +
+      theme(panel.grid.minor = element_blank(),
+            panel.grid.major = element_blank(),
+            axis.text = element_blank(),
+            axis.ticks = element_blank(),
+            legend.position = "none",
+            plot.margin = unit(c(0, 0, 0, 0), "cm"))
+  } 
+  
+  p[[i]] <- plot
+}
+
+pFinal <- plot_grid(plotlist = p, align = "v", ncol = 1)
+ggsave(plot=pFinal, filename = "figure6/dmrMethylDirSigEvents.pdf", height = 10, width = 8, units = "in")
+pFinal
+```
+
+#### DMR Density comparison
+
+```{r}
+### ----------------------------------------------------------
+### DMR DENSITY COMPARISONS
+### ----------------------------------------------------------
+
+files8 <- grep("/plottingDensityValues.txt", list.files("/projects/hpv_nanopore_prj/htmcp/call_integration/output", 
+                                           recursive = T, full.names = T),value = T)
+files8_500kbup <- grep("dmr_permute_500kbup", files8,value = T)
+files8_500kbdown <- grep("dmr_permute_500kbdown", files8,value = T)
+names8_500kbup <- gsub("/projects/hpv_nanopore_prj/htmcp/call_integration/output/|/event_phase|/dmr_permute_500kbup/plottingDensityValues.txt", "", files8_500kbup)
+names8_500kbdown <- gsub("/projects/hpv_nanopore_prj/htmcp/call_integration/output/|/event_phase|/dmr_permute_500kbdown/plottingDensityValues.txt", "", files8_500kbdown)
+
+# Import data
+methDensity_500kbup <- lapply(files8_500kbup, read.delim, header = TRUE, sep = "\t")
+names(methDensity_500kbup) <- names8_500kbup
+methDensity_500kbup <- dplyr::bind_rows(methDensity_500kbup, .id = "id")
+methDensity_500kbup$region <- "upstream"
+
+methDensity_500kbdown <- lapply(files8_500kbdown, read.delim, header = TRUE, sep = "\t")
+names(methDensity_500kbdown) <- names8_500kbdown
+methDensity_500kbdown <- dplyr::bind_rows(methDensity_500kbdown, .id = "id")
+methDensity_500kbdown$region <- "downstream"
+
+# put together
+methDensity <- rbind(methDensity_500kbup, methDensity_500kbdown)
+
+# add info
+methDensity$id <- gsub("/", ":", methDensity$id)
+methDensity$pvalue <- m$pval[match(methDensity$id, m$id)]
+methDensity$number <- m$number[match(methDensity$id, m$id)]
+methDensity$number <- factor(methDensity$number, levels = 1:nrow(m))
+
+# plot
+plotD <- ggplot(methDensity %>% filter(!is.na(number)), aes(x = region, y = dmr.density)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(aes(colour = sample), height = 0, width = 0.2, size =2, alpha=0.5) + 
+  facet_wrap(vars(number), nrow = 5, scales = "free_y") +
+  theme_minimal() +
+  labs(x = NULL, y = "DMR Density") +
+  #annotate("text", x=1.3, y=max(de$dmr.density[de$region == "hpv_region"]), 
+  #         label= paste0("pvalue = ", p), 
+  #         colour = "grey30", size = 5) + 
+  scale_colour_manual(values = c("#e63946", "#1d3557")) +
+  theme(panel.grid = element_blank(), 
+        axis.text.y = element_text(size = 13),
+        axis.text.x = element_text(size = 13),
+        axis.title = element_text(size=14), 
+        axis.ticks.y = element_line(),
+        axis.line = element_line(), 
+        legend.position = "none")
+plotD
+
+ggsave(plot=plotD, filename = "figure6/dmrDensityBoxplots.pdf", height = 10, width = 14, units = "in")
+```
+
+#### HP Methylation Significance
+
+```{r}
+### ----------------------------------------------------------
+### HP METHYLATION IN SIGNIFICANT EVENTS
+### ----------------------------------------------------------
+
+dmrs_sig <- dmrsFilt %>% filter(event.id %in% sig_event_ids)
+dmrs_sig <- dmrs_sig %>% filter(abs(hpvDistStart) < 5000000)
+dmrs_sig <- melt(dmrs_sig, id.vars = c("event.id","hpvDistStart"), measure.vars = c("meanMethy1", "meanMethy2"), variable.name = "haplotype", value.name = "meanMethyl")
+dmrs_sig <- dmrs_sig %>%
+    group_by(event.id,hpvDistStart) %>%
+    summarise(HP_low = min(meanMethyl), HP_high = max(meanMethyl)) %>%
+    pivot_longer(cols = c(HP_low, HP_high),names_to = "HP_type", values_to = "HP_value")
+dmrs_sig$significant_region <- m$significant_region[match(dmrs_sig$event.id, m$id)]
+dmrs_sig$significant_region <- gsub("one_direction_down|one_direction_up", "one_direction",
+                                    dmrs_sig$significant_region)
+#dmrs_sig <- dmrs_sig %>% filter(event.id == "HTMCP-03-06-02411:event9_chr9_26300536")
+
+plotE <- ggplot(dmrs_sig, aes(x = hpvDistStart/1000000, y = HP_value, colour = HP_type)) +
+    geom_vline(xintercept = 0, size = 1)+
+    geom_point(size = 1, alpha = 0.3) +
+    facet_grid(event.id ~ significant_region, drop = T) +
+    theme_bw() +
+    labs(x = "distance from HPV (Mb)", y = "% methylated", colour = "haplotype")+
+    scale_colour_manual(values=RColorBrewer::brewer.pal(11,"RdBu")[c(2,10)]) +
+    theme(panel.grid.major.y = element_blank(),
+          panel.grid.minor.y = element_blank(),
+          axis.title = element_text(size = 13, face = "bold", colour = "black"),
+          axis.text = element_text(size = 12, colour = "black"))
+ggsave(filename = "figure6/sig_events_HP_spread.pdf", plotE,
+       height = 6, width = 6)
+plotE
+```
+
+#### Save table
+
+```{r}
+### ----------------------------------------------------------
+### SAVE TABLES
+### ----------------------------------------------------------
+# integration event characteristics
+write.table(m, file = "tables/integrationEventsOnDMRHotspots.txt", quote = F, col.names = T, row.names = F, sep = "\t")
+
+kable(head(m))
+```
+
+## The significance of DMR density at HPV int events
+
+
+```{r}
+densityFilesHPV <- grep("hpvDensity", list.files("/projects/hpv_nanopore_prj/htmcp/call_integration/dmr_density", 
+                                           recursive = T, full.names = T),value = T)
+densityFilesCtrl <- grep("shuffleDensity", list.files("/projects/hpv_nanopore_prj/htmcp/call_integration/dmr_density", 
+                                           recursive = T, full.names = T),value = T)
+window <- gsub("/projects/hpv_nanopore_prj/htmcp/call_integration/dmr_density/hpvDensity|.txt", "", densityFilesHPV)
+
+# Import data
+densityHPVList <- lapply(densityFilesHPV, read.delim, header = TRUE, sep = "\t")
+names(densityHPVList) <- window
+densityCtrlList <- lapply(densityFilesCtrl, read.delim, header = TRUE, sep = "\t")
+names(densityCtrlList) <- window
+
+densityHPV <- dplyr::bind_rows(densityHPVList, .id = "window")
+densityHPV$test <- "HPV"
+densityCtrl <- dplyr::bind_rows(densityCtrlList, .id = "window")
+densityCtrl$test <- "control"
+
+# put dataframes together
+density <- rbind(densityHPV, densityCtrl)
+density <- density[density$window != "10000000",]
+
+# factor the windows smallest to largest
+options(scipen=999) # turn off scientific notation
+density$window <- factor(density$window, levels = as.character(sort(as.numeric(unique(density$window)))))
+
+# get the p values
+p_values <- density %>%
+  group_by(window) %>%
+  summarise(p_value = wilcox.test(density ~ test)$p.value) %>%
+  mutate(padj = p.adjust(p_value, method = "BH")) %>%
+  mutate(log10padj = -log10(padj))
+
+# make figure showing the DMR densities at different window sizes
+pdens <- ggplot(density, aes(x = test, y = density)) +
+    #geom_boxplot(outlier.shape = NA) + 
+    #geom_jitter(height = 0, width = 0.2, size =0.5, alpha=0.1) +
+    geom_violin()+
+    theme_bw() +
+    facet_grid(~ window)+
+    #scale_fill_manual(values = c("#8d99ae", "#fb8500"))+
+    #ggtitle("genes 1-200kb from HPV integration events")+
+    xlab("region") + 
+    ylab("DMR density") + 
+    theme(panel.grid.minor = element_blank(), 
+          axis.text = element_text(size = 13, colour = "black"),
+          axis.title = element_text(size=14, face = "bold"), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line(), 
+          legend.position = "none") +
+    geom_text(data = p_values, aes(x = 1.5, y = max(density$density), label = paste("padj =", signif(padj, 2))), size = 3)
+ggsave(plot=pdens, filename = "figure6/testAllDMRsDistance.pdf", height = 5, width = 12, units = "in")
+pdens
+
+# make a figure showing the p values at the window sizes
+p_values$start <- 5000000 - as.numeric(as.character(p_values$window))/2
+p_values$end <- 5000000 + as.numeric(as.character(p_values$window))/2
+
+ppval <- ggplot(p_values, aes(ymin = as.integer(window), ymax = as.integer(window)+0.8, xmin = start, xmax = end, fill = log10padj)) +
+    geom_rect() + 
+    theme_minimal() +
+    scale_fill_distiller(palette = "PuBuGn", direction = 1)+
+    theme(panel.grid.minor = element_blank(), 
+          panel.grid.major = element_blank(), 
+          axis.text = element_text(size = 13, colour = "black"),
+          axis.title = element_text(size=14, face = "bold"), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line())
+ggsave(plot=ppval, filename = "figure6/pvalueDMRDistance.pdf", height = 5, width = 7, units = "in")
+ppval
+```
+
+#### GC Content Testing
+```{r}
+# Calculate the mean GC content for each window
+mean_gc <- density %>%
+  group_by(window, test) %>%
+  summarize(mean_gc = mean(gc_content, na.rm = TRUE))
+
+# make a distribution plot
+pGcHpv <- ggplot(density, aes(x = gc_content, colour = window, fill = window)) +
+    geom_density(alpha = 0.5, bw = 2) +
+    facet_grid(test ~ window) +
+    theme_bw() +
+    xlab("GC content") + 
+    xlim(20,65)+
+    #geom_vline(data = mean_gc, aes(xintercept = mean_gc), linetype = 2, size = 0.5) +
+    theme(panel.grid.minor = element_blank(), 
+          axis.text = element_text(size = 13, colour = "black"),
+          axis.title = element_text(size=14, face = "bold"), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line(),
+          legend.position = "none") 
+ggsave(plot=pGcHpv, filename = "figure6/gcContentCtrlHPV.pdf", height = 5, width = 7, units = "in")
+pGcHpv
+```
+
+
+## Expression of nearby genes
+
+```{r, include=FALSE}
+### -------------------------------------------------------------------------------
+### READ IN FILES 
+### -------------------------------------------------------------------------------
+
+int <- intOnly
+genes <- read.delim("/projects/hpv_nanopore_prj/htmcp/rproj/gene_expression/biomart_ensembl100_GRCh38.sorted.bed.gz", header = F)
+hpvgene <- allgenes
+htmcp_mat <- read.delim("/projects/hpv_nanopore_prj/htmcp/gdc_gene_expression/HTMCP_GDC_TPM-unstranded_matrix.rm-dups.txt", header = T)
+
+#add info from dist to hpvgene
+hpvgene$event <- dist$event[match(paste0(hpvgene$sample, hpvgene$hpv.sites), paste0(dist$sample, dist$sites))]
+
+hpvgene$integration.type <- intOnly$type[match(paste0(hpvgene$sample, hpvgene$event), paste0(intOnly$sample, intOnly$event))]
+hpvgene$nsites <- intOnly$nsites[match(paste0(hpvgene$sample, hpvgene$event), paste0(intOnly$sample, intOnly$event))]
+hpvgene$HPV.type <- intOnly$HPV.type[match(paste0(hpvgene$sample, hpvgene$event), paste0(intOnly$sample, intOnly$event))]
+hpvgene$is.event.transcribed <- sum$is.event.transcribed[match(paste0(hpvgene$sample, hpvgene$event), paste0(sum$sample, sum$event))]
+
+expr_sample <- htmcp_mat[,c(1,3)]
+#expr_sample <- expr_sample[expr_sample$HTMCP.03.06.02002 > 0,]
+```
+
+
+
+
+```{r, include=FALSE}
+# add the distance between the middle of the integration event and the middle of the gene
+hpvgene$event.middle <- hpvgene$start+(hpvgene$end-hpvgene$start)
+hpvgene$gene.middle <- hpvgene$gene.start+(hpvgene$gene.end-hpvgene$gene.start)
+hpvgene$distance <- ifelse(hpvgene$gene.start < hpvgene$start & hpvgene$gene.end < hpvgene$start, -(hpvgene$start - hpvgene$gene.start), ifelse(
+    hpvgene$gene.start > hpvgene$end, hpvgene$gene.start - hpvgene$end, 0))
+
+# genes type - filter for protein coding
+hpvgene$gene.type <- genes$V7[match(hpvgene$gene.id, genes$V4)]
+hpvgene <- hpvgene %>% filter(gene.type == "protein_coding")
+genes <- genes %>% filter(V7 == "protein_coding")
+
+# take out genes with no expression 
+max <- apply(htmcp_mat[,-1], 1, max) 
+htmcpExpr <- htmcp_mat[max > 1 & htmcp_mat$gene.id %in% genes$V4,] # Only genes expressed in at least 1 sample (RPKM > 5 in at least 1 sample)
+
+# melt the gene expression
+htmcpEDF <- melt(htmcpExpr)
+htmcpEDF$variable <- gsub("\\.", "-", htmcpEDF$variable)
+htmcpEDF$value <- log10(htmcpEDF$value+0.001)
+```
+
+
+```{r, include=FALSE}
+genehtmcp <- hpvgene[grep("HTMCP", hpvgene$sample),]
+genehtmcp <- genehtmcp[genehtmcp$gene.id %in% htmcpExpr$gene.id,]
+
+find_outlier <- function(x) {
+    return(x < quantile(x, .25) - 1.5*IQR(x) | x > quantile(x, .75) + 1.5*IQR(x))
+}
+
+expr_significance <- function(gene,sample,expr_mat){
+    g <- gene
+    s <- sample
+    expr <- expr_mat
+    
+    # pick 1000 random genes
+    #random <- sample(expr$gene, 1000)
+    #rFC <- numeric()
+    #for (i in 1:1000) {
+    #    rg <- random[i]
+    #    exprR <- expr[expr$gene == rg,]
+    #    med <- median(exprR$value)
+    #    med <- ifelse(med == 0, 0.00001,med)
+    #    sample <- exprR$value[exprR$variable == s]
+    #    sample <-  ifelse(sample == 0, 0.00001,sample)
+    #    fc <- log2(sample/med)
+    #    rFC <- c(rFC,fc)
+    #}
+    
+    # get the expression fold change from the median of the gene
+    exprG <- expr[expr$gene.id == g,]
+    med <- median(exprG$value)
+    sam <- exprG$value[exprG$variable == s]
+    fc <- log2(sam/med)
+    exprG$outlier <- ifelse(find_outlier(exprG$value), "outlier", "not")
+    outlier <- exprG$outlier[exprG$variable == s]
+    exprG$zscores <- scale(exprG$value)
+    z <- exprG$zscores[exprG$variable == s]
+    
+    # put the values together
+    #n <- ifelse(fc > 0, sum(rFC > fc), sum(rFC < fc))
+    #p <- n/1000
+    #p <- ifelse(p == 0, 0.001,p)
+    df <- data.frame(sample.expr=sam, median.expr=med, log2FC=fc, is.outlier=outlier, zscore = z)
+    return(df)
+}
+
+# run the function
+pvalH2 <- list()
+for (i in 1:nrow(genehtmcp)) {
+    df <- expr_significance(gene = genehtmcp$gene.id[i], sample = genehtmcp$sample[i], expr_mat = htmcpEDF)
+    pvalH2[[i]] <- df
+}
+
+pvalHdf <- dplyr::bind_rows(pvalH2)
+genehtmcpP <- cbind(genehtmcp,pvalHdf)
+genehtmcpPFilt <- genehtmcpP[genehtmcpP$sample.expr > 0,]
+
+# put together
+allgenes <- genehtmcpPFilt
+allgenes <- allgenes[complete.cases(allgenes),]
+```
+
+
+```{r, include=FALSE}
+# Define the directories for the first and second datasets
+dirASE <- "/projects/hpv_nanopore_prj/htmcp/ase/IMPALA/output"
+
+# List all files containing "integration_type.txt" in both directories
+ase_files <- list.files(dirASE, recursive = TRUE, full.names = T, pattern = "summaryTable.tsv")
+
+# Extract sample names from the file paths
+ase_names <- gsub(paste0(dirASE, "/|/summaryTable.tsv"), "", ase_files)
+
+# Read data from all files and store in a list
+ase_list <- lapply(ase_files, read.delim, header=T)
+
+# Set names for the list elements based on sample names
+names(ase_list) <- ase_names
+
+# Combine the dataframes in the list into a single dataframe, adding an "event" column
+ase <- bind_rows(ase_list, .id = "sample")
+
+```
+
+
+```{r, include=FALSE}
+allgenes$ase_result <- ase$aseResults[match(paste0(allgenes$sample, allgenes$gene.id), paste0(ase$sample, ase$gene))]
+allgenes$ase_MAF <- ase$majorAlleleFrequency[match(paste0(allgenes$sample, allgenes$gene.id), paste0(ase$sample, ase$gene))]
+allgenes$event.loci <- paste0(allgenes$sample, ":", allgenes$sites)
+
+upgenes <- allgenes[allgenes$is.outlier == "outlier" & allgenes$log2FC > 0,]
+downgenes <- allgenes[allgenes$is.outlier == "outlier" & allgenes$log2FC < 0,]
+outliergenes <- allgenes[allgenes$is.outlier == "outlier",]
+outliergenes$ase_result <- ifelse(is.na(outliergenes$ase_result), "no_data", outliergenes$ase_result)
+outliergenes$ase_result <- factor(outliergenes$ase_result, levels = c("ASE", "BAE","no_data"))
+```
+
+#### ASE At NR4A1 and NR4A3
+
+
+```{r}
+testgene <- "NR4A1"
+test_sample <- allgenes$sample[allgenes$gene.id == testgene]
+
+p1_ase <- ase %>%
+    filter(gene == testgene) %>%
+    mutate(colour = ifelse(sample %in% test_sample, "test", "others")) %>%
+    ggplot(aes(x = gene, y = majorAlleleFrequency)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(aes(fill = colour, colour = aseResults), height = 0, width = 0.2, size =4, shape = 21, stroke = 1, alpha = 0.8) +
+    scale_colour_manual(values = c("black", "grey"), na.value = "white")+
+    labs(x = NULL, y = "RNA major allele frequency") +
+    scale_fill_manual(values = c("grey", "dark red")) +
+    theme_minimal() +
+    theme(panel.grid = element_blank(), 
+          axis.text = element_text(size = 13, colour = "black"),
+          axis.title = element_text(size=14, colour = "black"), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line(), 
+          legend.position = "none") 
+ggsave(plot = p1_ase, filename = paste0("figure6/",testgene, "_MAF_ASE.pdf"), width = 2.7, height = 2.7)
+p1_ase
+
+# find the recurring genes
+t <- table(outliergenes$gene.id)
+upgenes_reocurring <-  t[t > 1]
+upgenes_reocurring <- upgenes_reocurring[order(upgenes_reocurring, decreasing = T)]
+upgenes_reocurring
+```
+
+
+```{r, include=FALSE}
+#### write a function for getting significant p values for MAF
+ase$zscore_maf <- scale(ase$majorAlleleFrequency)
+
+maf_pvalue2 <- function(gene, sample, ase=ase){
+    s <- sample
+    z <- ase$zscore_maf[ase$sample == s & ase$gene == gene]
+    p <- ase$padj[ase$sample == s & ase$gene == gene]
+    
+    # pick random genes that were tested in this sample
+    ase_genes_sub <- ase$gene[ase$sample == sample]
+    ctrl_genes <- sample(ase_genes_sub, 1100)
+    
+    # get the fold change in the control genes
+    all_fc_ctrl <- list()
+    for (i in 1:length(ctrl_genes)) {
+        rgene <- ctrl_genes[i]
+        sample_maf <- ase$majorAlleleFrequency[ase$gene == rgene & ase$sample == sample]
+        z_ctrl <- ase$zscore_maf[ase$sample == s & ase$gene == rgene]
+        pval_ctrl <- ase$padj[ase$sample == s & ase$gene == rgene]
+        df_ctrl <- data.frame(gene=rgene,sample_MAF=sample_maf,zscore=z_ctrl,padj=pval_ctrl)
+        all_fc_ctrl[[i]] <- df_ctrl
+    }    
+    all_fc <- bind_rows(all_fc_ctrl)
+    all_fc <- all_fc[!is.na(all_fc$zscore),] # remove ones that had no median
+    # pick 1000 random rows
+    all_fc <- all_fc[sample(1:nrow(all_fc),1000),]
+    
+    num_higher <- sum(all_fc$zscore > z & all_fc$padj < 0.05)
+    pvalue <- num_higher/5000
+}
+
+maf_pvalue <- function(gene, sample, ase=ase){
+    sample_maf <- ase$majorAlleleFrequency[ase$gene == gene & ase$sample == sample]
+    other_maf <- mean(ase$majorAlleleFrequency[ase$gene == gene & ase$sample != sample])
+    fc <- sample_maf/other_maf
+    
+    # pick random genes that were tested in this sample
+    ase_genes_sub <- ase$gene[ase$sample == sample]
+    ctrl_genes <- sample(ase_genes_sub, 1100)
+    
+    # get the fold change in the control genes
+    all_fc_ctrl <- list()
+    for (i in 1:length(ctrl_genes)) {
+        rgene <- ctrl_genes[i]
+        sample_maf_ctrl <- ase$majorAlleleFrequency[ase$gene == rgene & ase$sample == sample]
+        other_maf_ctrl <- mean(ase$majorAlleleFrequency[ase$gene == rgene & ase$sample != sample])
+        fc_ctrl <- sample_maf_ctrl/other_maf_ctrl 
+        pval_ctrl <- ase$padj[ase$sample == sample & ase$gene == rgene]
+        df_ctrl <- data.frame(gene=rgene,sample_MAF=sample_maf_ctrl,med_MAF=other_maf_ctrl,foldchange = fc_ctrl,padj = pval_ctrl)
+        all_fc_ctrl[[i]] <- df_ctrl
+    }    
+    all_fc <- bind_rows(all_fc_ctrl)
+    all_fc <- all_fc[!is.na(all_fc$med_MAF),] # remove ones that had no median
+    # pick 1000 random rows
+    all_fc <- all_fc[sample(1:nrow(all_fc),1000),]
+    
+    # get the pvalue
+    num_higher <- sum(all_fc$foldchange > fc & all_fc$padj < 0.05)
+    pvalue <- num_higher/1000
+    
+    return(pvalue)
+}
+
+pval1 <- maf_pvalue("NR4A3","HTMCP-03-06-02428",ase = ase)
+pval2 <- maf_pvalue("NR4A1","HTMCP-03-06-02109",ase = ase)
+
+```
+
+
+```{r}
+### -------------------------------------------------------------------------------
+### ADJUST THE PVALUES AROUND THE EVENT IN EACH SAMPLE
+### -------------------------------------------------------------------------------
+genehtmcpPFilt$log2FC.L <- "> 3"
+genehtmcpPFilt$log2FC.L[genehtmcpPFilt$log2FC <= 3] <- NA
+
+labs <- outliergenes[outliergenes$log2FC > 2 | abs(outliergenes$log2FC) > 1 & outliergenes$ase_result == "ASE",]
+labs <- labs[complete.cases(labs[,1:3]),]
+labs <- labs %>% filter(abs(distance) < 1000000)
+
+p_outliers <- outliergenes %>%
+    filter(abs(distance) < 1000000) %>%
+    ggplot(aes(x=distance,y=event.loci,fill=log2FC, colour = ase_result)) +
+    geom_hline(data=outliergenes %>% filter(abs(distance) < 1000000 & is.event.transcribed =="yes"), aes(yintercept = event.loci), colour = "grey", size = 2)+
+    geom_point(size=3, shape = 21, stroke = 1) +
+    scale_color_manual(values = list(ASE="black", BAE="grey", no_data="white"))+
+    scale_x_continuous(minor_breaks = seq(-1000000, 1000000, 100000), breaks = seq(-1000000, 1000000, 200000), limits = c(-1000000,1000000)) +
+    geom_text_repel(data=labs, 
+                    aes(x=distance,y=event.loci, label = gene.id), max.overlaps = 20, colour = "black", size = 3, fontface = "italic") +
+    facet_grid(integration.type ~ ., scales = "free_y", space = "free_y") +
+    scale_fill_distiller(palette = "RdBu",, limits = c(-5,5)) + 
+    theme_bw() +
+    theme(axis.text.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text = element_text(size = 13, colour = "black"),
+          axis.title = element_text(size=14, colour = "black", face = "bold"))
+ggsave(plot = p_outliers, filename = "figure6/outlier_genes_ase_expression.pdf", width = 6, height = 6)
+p_outliers
+```
+
+
+```{r}
+# make a figure for each bin
+
+outliergenes$log2FC <- log2(outliergenes$sample.expr/outliergenes$median.expr)
+
+p_outlier_dist <- ggplot(outliergenes, aes(x =abs(distance), y = log2FC, colour = ase_result)) +
+    geom_point(size = 3, alpha = 0.75) +
+    theme_bw() +
+    labs(x="distance from HPV integration (kb)", colour="ASE result")+
+    scale_x_continuous(minor_breaks = seq(0, 1000000, 100000), breaks = seq(0, 1000000, 200000)) +
+    scale_color_manual(values = list(ASE="#d81159", BAE="#218380", no_data="#d3d3d3")) +
+    theme(axis.text = element_text(colour = "black", size = 12),
+          axis.title = element_text(colour = "black", size = 14, face = "bold"),
+          legend.text = element_text(size = 12, colour = "black"),
+          legend.title = element_text(colour = "black", size = 14, face = "bold"))
+ggsave(plot = p_outlier_dist, filename = "figure6/outlier_genes_distance.pdf", width = 6, height = 2.5)
+
+### -------------------------------------------------------------------------------
+### SAVE TABLES
+### -------------------------------------------------------------------------------
+
+write.table(outliergenes, file = "tables/outlierGeneExpression.txt", quote = F, col.names = T, row.names = F, sep = "\t")
+
+p_outlier_dist
+```
+
+#### Gene expression
+
+```{r, include=FALSE}
+### -------------------------------------------------------------------------------
+### TEST DIFFERENT WINDOW SIZES (10KB, 100KB, 500KB, 1MB)
+### -------------------------------------------------------------------------------
+    
+# Use case_when to assign bin names
+outliergenes <- outliergenes %>%
+    mutate(bin = case_when(
+        abs(distance) == 0 ~ "0",  # Handle the case when distance is exactly zero
+        abs(distance) <= 100000 ~ "1-100000",
+        abs(distance) > 100000 & abs(distance) <= 200000 ~ "100000-200000",
+        abs(distance) > 200000 & abs(distance) <= 300000 ~ "200000-300000",
+        abs(distance) > 300000 & abs(distance) <= 400000 ~ "300000-400000",
+        abs(distance) > 400000 & abs(distance) <= 500000 ~ "400000-500000",
+        abs(distance) > 500000 & abs(distance) <= 600000 ~ "500000-600000",
+        abs(distance) > 600000 & abs(distance) <= 700000 ~ "600000-700000",
+        abs(distance) > 700000 & abs(distance) <= 800000 ~ "700000-800000",
+        abs(distance) > 800000 & abs(distance) <= 900000 ~ "800000-900000",
+        abs(distance) > 900000 & abs(distance) <= 1000000 ~ "900000-1000000",
+        abs(distance) > 1000000 & abs(distance) <= 1100000 ~ "1000000-1100000",
+        TRUE ~ "other")
+    ) %>%
+    filter(abs(distance) < 1000000)
+
+allgenes <- allgenes %>%
+    mutate(bin = case_when(
+        abs(distance) == 0 ~ "0",  # Handle the case when distance is exactly zero
+        abs(distance) <= 100000 ~ "1-100000",
+        abs(distance) > 100000 & abs(distance) <= 200000 ~ "100000-200000",
+        abs(distance) > 200000 & abs(distance) <= 300000 ~ "200000-300000",
+        abs(distance) > 300000 & abs(distance) <= 400000 ~ "300000-400000",
+        abs(distance) > 400000 & abs(distance) <= 500000 ~ "400000-500000",
+        abs(distance) > 500000 & abs(distance) <= 600000 ~ "500000-600000",
+        abs(distance) > 600000 & abs(distance) <= 700000 ~ "600000-700000",
+        abs(distance) > 700000 & abs(distance) <= 800000 ~ "700000-800000",
+        abs(distance) > 800000 & abs(distance) <= 900000 ~ "800000-900000",
+        abs(distance) > 900000 & abs(distance) <= 1000000 ~ "900000-1000000",
+        abs(distance) > 1000000 & abs(distance) <= 1100000 ~ "1000000-1100000",
+        TRUE ~ "other")
+    ) %>%
+    filter(abs(distance) < 1000000)
+```
+
+```{r}
+### -------------------------------------------------------------------------------
+### DETERMINE FC DIFFERENCE IN EXPRESSED VS NON-EXPRESSED EVENTS 
+### -------------------------------------------------------------------------------
+
+give.n <- function(x){
+    return(c(y = median(x)*1.05, label = length(x))) 
+    # experiment with the multiplier to find the perfect position
+}
+
+# genes that are overlapping events
+
+p0 <- allgenes %>%
+    #filter(grepl("HTMCP", sample)) %>%
+    filter(bin =="0") %>%
+    ggplot(aes(y = log2FC, x = is.event.transcribed, fill = is.event.transcribed)) +
+    geom_boxplot(outlier.shape = NA) + 
+    geom_jitter(height = 0, width = 0.2, size =2, alpha=0.5) +
+    theme_minimal() +
+    scale_fill_manual(values = c("#8d99ae", "#fb8500"))+
+    #ggtitle("genes overlapping HPV integration events")+
+    xlab("HPV fusion transcript detected?") + 
+    stat_summary(fun.data = give.n, geom = "text", fun = median, 
+                 position = position_dodge(width = 0.75)) +
+    theme(panel.grid.minor = element_blank(), 
+          axis.text = element_text(size = 13, colour = "black"),
+          axis.title = element_text(size=14, face = "bold"), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line(), 
+          legend.position = "none") +
+    stat_compare_means(method = "wilcox.test")
+
+p200 <- allgenes %>%
+    #filter(grepl("HTMCP", sample)) %>%
+    filter(bin %in% c("1-100000", "100000-200000")) %>%
+    ggplot(aes(y = log2FC, x = is.event.transcribed, fill = is.event.transcribed)) +
+    geom_boxplot(outlier.shape = NA) + 
+    geom_jitter(height = 0, width = 0.2, size =2, alpha=0.5) +
+    theme_minimal() +
+    scale_fill_manual(values = c("#8d99ae", "#fb8500"))+
+    #ggtitle("genes 1-200kb from HPV integration events")+
+    xlab("HPV fusion transcript detected?") + 
+    stat_summary(fun.data = give.n, geom = "text", fun = median, 
+                 position = position_dodge(width = 0.75)) +
+    theme(panel.grid.minor = element_blank(), 
+          axis.text = element_text(size = 13, colour = "black"),
+          axis.title = element_text(size=14, face = "bold"), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line(), 
+          legend.position = "none") +
+    stat_compare_means(method = "wilcox.test")
+
+p500 <- allgenes %>%
+    #filter(grepl("HTMCP", sample)) %>%
+    filter(bin %in% c("200000-300000", "300000-400000","400000-500000")) %>%
+    ggplot(aes(y = log2FC, x = is.event.transcribed, fill = is.event.transcribed)) +
+    geom_boxplot(outlier.shape = NA) + 
+    geom_jitter(height = 0, width = 0.2, size =2, alpha=0.5) +
+    theme_minimal() +
+    scale_fill_manual(values = c("#8d99ae", "#fb8500"))+
+    #ggtitle("genes 1-200kb from HPV integration events")+
+    xlab("HPV fusion transcript detected?") + 
+    stat_summary(fun.data = give.n, geom = "text", fun = median, 
+                 position = position_dodge(width = 0.75)) +
+    theme(panel.grid.minor = element_blank(), 
+          axis.text = element_text(size = 13, colour = "black"),
+          axis.title = element_text(size=14, face = "bold"), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line(), 
+          legend.position = "none") +
+    stat_compare_means(method = "wilcox.test")
+
+p_genes <- plot_grid(p0,p200,p500, align = "h",nrow = 1)
+ggsave(plot=p_genes, filename = "figure6/log2FCGenesTranscribed.pdf", height = 3, width = 8, units = "in")
+p_genes
+```
+
+```{r, include=FALSE}
+length(unique(allgenes$sample))
+length(unique(allgenes$gene.id))
+
+outlier200 <- outliergenes[abs(outliergenes$distance) < 200000,]
+nrow(outlier200)
+summary(outlier200$ase_result)
+length(unique(outlier200$sample))
+length(unique(paste0(outlier200$sample, outlier200$event)))
+sum(outlier200$log2FC > 0)
+sum(outlier200$log2FC > 0)/length(outlier200$log2FC )
+
+outlier1Mb <- outliergenes[abs(outliergenes$distance) > 200000,]
+nrow(outlier1Mb)
+summary(outlier1Mb$ase_result)
+length(unique(outlier1Mb$sample))
+length(unique(paste0(outlier1Mb$sample, outlier200$event)))
+sum(outlier1Mb$log2FC > 0)
+sum(outlier1Mb$log2FC > 0)/length(outlier1Mb$log2FC )
+
+fisher.test(matrix(data = c(sum(outlier200$log2FC > 0),sum(outlier200$log2FC < 0),
+                            sum(outlier1Mb$log2FC > 0), sum(outlier1Mb$log2FC < 0)), nrow = 2, byrow = T))
+
+fisher.test(matrix(data = c(sum(outlier200$ase_result == "ASE"),sum(outlier200$ase_result != "BAE"),
+                            sum(outlier1Mb$ase_result == "ASE"),sum(outlier1Mb$ase_result != "BAE")), nrow = 2, byrow = T))
+```
+
+```{r}
+genes <- outlier200$gene.id
+test_samples <- gsub("-", ".", outlier200$sample)
+plist <- NULL
+
+for (i in 1:length(genes)){
+  p2 <- expr_mat %>%
+    filter(gene.id == genes[i]) %>%
+    gather(sample, tpm,-gene.id) %>%
+    mutate(colour = ifelse(sample == test_samples[i], "test", "others")) %>%
+    ggplot(aes(x = gene.id, y = log10(tpm))) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(aes(colour = colour), height = 0, width = 0.2, size =3, alpha=0.5) +
+    labs(x = NULL, y = "log10(TPM)") +
+    scale_colour_manual(values = c("grey", "dark red")) +
+    theme_minimal() +
+    theme(panel.grid = element_blank(), 
+          axis.text = element_text(size = 13),
+          axis.title = element_text(size=14), 
+          axis.ticks.y = element_line(),
+          axis.line = element_line(), 
+          legend.position = "none") 
+  plist[[i]] <- p2
+}
+
+pgrid <- plot_grid(plotlist=plist, nrow = 10)
+ggsave(plot = pgrid, filename = "figure6/outlierGeneExpressionBoxplot.pdf", width = 12, height = 15)
+pgrid
+```
+
+
