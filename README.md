@@ -71,7 +71,4 @@ Please download the `figures/AllFigsMaster.html` document to see the most recent
 <br />
 # Contributors
 The creator of these scripts is
-Vanessa Porter.
-# Contributors <br />
-The creator of these scripts is
-Vanessa Porter.
+Dr. Vanessa Porter.
