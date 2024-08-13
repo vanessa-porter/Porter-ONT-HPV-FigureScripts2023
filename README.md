@@ -4,7 +4,7 @@ The figure scripts pertaining to the manuscript titled "Genomic structures and r
 # Script Directory <br />
 
 ### **All Figures** <br />
-Please download the `figures/AllFigsMaster.html` document to see the most recent run through of all figures. Associated scripts can also be found in the `figures/AllFigsMaster.Rmd` R markdown. Below are figure-specific scripts but the might be more outdated than the R markdown document. 
+Please download the `figures/AllFigsMaster.html` document to see the most recent run through of all figures. Associated scripts for processing can also be found in the `figures/AllFigsMaster.Rmd` R markdown but are not shown in the HTML to reduce the size. Below are figure-specific scripts but the most up-to-date versions can be found in the R markdown document. 
 
 ### **Figure 1** <br />
 | Panel           | Script                                    | 
@@ -69,6 +69,3 @@ Please download the `figures/AllFigsMaster.html` document to see the most recent
 | Figure 6f       | IGV Snapshot                              | 
 | Figure 6g       | IGV Snapshot                              | 
 <br />
-# Contributors
-The creator of these scripts is
-Dr. Vanessa Porter.
